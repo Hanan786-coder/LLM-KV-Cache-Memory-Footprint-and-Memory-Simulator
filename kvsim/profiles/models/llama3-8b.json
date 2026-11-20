@@ -1,0 +1,12 @@
+{
+  "name": "LLaMA-3-8B",
+  "num_layers": 32,
+  "hidden_size": 4096,
+  "num_heads": 32,
+  "num_kv_heads": 8,
+  "head_dim": 128,
+  "intermediate_size": 14336,
+  "vocab_size": 128256,
+  "mlp_type": "swiglu",
+  "max_context": 8192
+}

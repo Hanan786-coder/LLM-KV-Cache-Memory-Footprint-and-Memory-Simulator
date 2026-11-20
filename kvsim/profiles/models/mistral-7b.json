@@ -1,0 +1,12 @@
+{
+  "name": "Mistral-7B",
+  "num_layers": 32,
+  "hidden_size": 4096,
+  "num_heads": 32,
+  "num_kv_heads": 8,
+  "head_dim": 128,
+  "intermediate_size": 14336,
+  "vocab_size": 32000,
+  "mlp_type": "swiglu",
+  "max_context": 32768
+}

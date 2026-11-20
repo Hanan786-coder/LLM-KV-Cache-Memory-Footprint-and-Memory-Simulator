@@ -1,0 +1,7 @@
+{
+  "name": "NVIDIA A100 40GB (SXM)",
+  "memory_gib": 40,
+  "bandwidth_gbs": 1555,
+  "peak_fp16_tflops": 312,
+  "peak_int8_tops": 624
+}

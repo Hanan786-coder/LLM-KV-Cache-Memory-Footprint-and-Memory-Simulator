@@ -1,0 +1,12 @@
+{
+  "name": "LLaMA-7B",
+  "num_layers": 32,
+  "hidden_size": 4096,
+  "num_heads": 32,
+  "num_kv_heads": 32,
+  "head_dim": 128,
+  "intermediate_size": 11008,
+  "vocab_size": 32000,
+  "mlp_type": "swiglu",
+  "max_context": 2048
+}

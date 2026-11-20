@@ -346,29 +346,36 @@ scheduler does not know which one it is using.
 class KVAllocator(ABC):
     name: str                                     # e.g. "paged-16", "contig-max-first"
     pool: KVPool
+    capacity_tokens: int                          # slots it can hand out (allocated + free)
 
-    # admission and growth
-    def can_admit(self, seq: Sequence, n_tokens: int) -> bool: ...
-    def admit(self, seq: Sequence, n_tokens: int) -> None: ...   # claim slots for the prompt
-    def can_append(self, seq: Sequence, n: int = 1) -> bool: ...
-    def append(self, seq: Sequence, n: int = 1) -> None: ...     # claim slots for new tokens
-    def trim_front(self, seq: Sequence, n: int) -> None: ...     # sliding window: drop oldest tokens
-    def free(self, seq: Sequence) -> int: ...                    # release everything; returns slots freed
+    # admission and growth; requests are identified by an integer seq_id
+    def can_admit(self, seq_id, n_tokens, request=None) -> bool: ...
+    def admit(self, seq_id, n_tokens, request=None) -> None: ...  # claim slots for the prompt
+    def can_append(self, seq_id, n=1) -> bool: ...
+    def append(self, seq_id, n=1) -> None: ...                    # claim slots for new tokens
+    def trim_front(self, seq_id, n) -> None: ...                  # sliding window (added in M6)
+    def free(self, seq_id) -> int: ...                            # release everything; returns slots freed
 
     # accounting, all in token slots
-    def held_tokens(self, seq: Sequence) -> int: ...             # slots this request holds
-    def allocated_tokens(self) -> int: ...                       # sum over all requests
-    def free_tokens(self) -> int: ...
-    def largest_free_run(self) -> int: ...                       # biggest single allocation possible now
-    def check_invariants(self) -> None: ...                      # used by tests after every step
+    def num_tokens(self, seq_id) -> int: ...       # slots the request has claimed
+    def held_tokens(self, seq_id) -> int: ...      # slots it holds (claimed + slack)
+    def allocated_tokens(self) -> int: ...         # sum over all requests
+    def free_tokens(self) -> int: ...              # capacity_tokens - allocated_tokens()
+    def largest_free_run(self) -> int: ...         # biggest single allocation possible now
+    def check_invariants(self) -> None: ...        # used by tests after every step
+    def __contains__(self, seq_id) -> bool: ...    # does the request hold memory here?
 ```
 
-`admit` and `append` raise `AllocationError` if called when `can_*` is false. The
-scheduler always checks first.
+`request` (the `Request` from section 7) is only needed by the contiguous
+allocator, which uses it to size the reservation. The paged allocator ignores it.
+Calling `admit` or `append` when `can_*` is false, or using an unknown `seq_id`,
+raises `AllocationError`. The scheduler always checks first.
 
 ### 9.2 Paged allocator (vLLM-style)
 
 * The pool is cut into `num_blocks = pool_tokens // B` blocks, numbered `0..num_blocks-1`.
+  The fewer than `B` slots left over cannot be used, so the paged allocator's
+  `capacity_tokens` is `num_blocks x B`, slightly below `pool_tokens`.
 * **Free list:** a stack of block ids. A freed block is reused first (like vLLM's
   free list), and the result is deterministic.
 * **Block table:** for each request, a list of block ids. Logical block `i` holds

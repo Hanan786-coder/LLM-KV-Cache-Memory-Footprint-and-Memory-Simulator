@@ -1,0 +1,223 @@
+"""KV-cache allocators: how the pool's token slots are handed out to requests.
+
+Every allocator manages one ``KVPool`` and keeps, for each request it serves,
+how many token slots the request has claimed (``num_tokens``) and how many it
+holds (``held_tokens``). Held minus claimed is slack the request cannot use yet.
+
+* ``PagedAllocator`` -- vLLM's PagedAttention: fixed-size blocks of ``block_size``
+  tokens, a block table per request and a free block list.
+* ``ContiguousAllocator`` -- one reservation per request (added in milestone M3).
+
+Requests are identified by an integer ``seq_id``. All sizes are in token slots;
+multiply by ``pool.bytes_per_token`` for bytes.
+"""
+
+from __future__ import annotations
+
+import math
+from abc import ABC, abstractmethod
+
+from .config import ConfigError
+from .kvpool import KVPool
+from .workload import Request
+
+BLOCK_TABLE_ENTRY_BYTES = 4  # one int32 block id per entry
+
+
+class AllocationError(RuntimeError):
+    """An allocator call that is not allowed right now (check ``can_*`` first)."""
+
+
+class KVAllocator(ABC):
+    """What the scheduler needs from any allocator."""
+
+    name: str
+    pool: KVPool
+
+    @property
+    @abstractmethod
+    def capacity_tokens(self) -> int:
+        """Token slots this allocator can hand out (allocated + free)."""
+
+    # --- admission and growth ---
+    @abstractmethod
+    def can_admit(self, seq_id: int, n_tokens: int, request: Request | None = None) -> bool:
+        """Whether a new request can claim its first ``n_tokens`` slots now."""
+
+    @abstractmethod
+    def admit(self, seq_id: int, n_tokens: int, request: Request | None = None) -> None:
+        """Claim slots for a new request's first ``n_tokens`` tokens (its prompt)."""
+
+    @abstractmethod
+    def can_append(self, seq_id: int, n: int = 1) -> bool:
+        """Whether a request can claim ``n`` more slots now."""
+
+    @abstractmethod
+    def append(self, seq_id: int, n: int = 1) -> None:
+        """Claim ``n`` more slots for a request."""
+
+    @abstractmethod
+    def free(self, seq_id: int) -> int:
+        """Release everything a request holds; returns the slots freed."""
+
+    # --- accounting, in token slots ---
+    @abstractmethod
+    def num_tokens(self, seq_id: int) -> int:
+        """Slots the request has claimed."""
+
+    @abstractmethod
+    def held_tokens(self, seq_id: int) -> int:
+        """Slots the request holds (claimed plus unusable slack)."""
+
+    @abstractmethod
+    def allocated_tokens(self) -> int:
+        """Slots held by all requests together."""
+
+    @abstractmethod
+    def largest_free_run(self) -> int:
+        """Biggest single allocation possible right now."""
+
+    @abstractmethod
+    def check_invariants(self) -> None:
+        """Raise AssertionError if the internal state is inconsistent (used by tests)."""
+
+    @abstractmethod
+    def __contains__(self, seq_id: int) -> bool:
+        """Whether the request currently holds memory here."""
+
+    def free_tokens(self) -> int:
+        return self.capacity_tokens - self.allocated_tokens()
+
+
+class PagedAllocator(KVAllocator):
+    """Fixed-size blocks, a block table per request and a LIFO free list.
+
+    Any free block can serve any request, so there is no external fragmentation.
+    The only waste is the unfilled end of each request's last block.
+    """
+
+    def __init__(self, pool: KVPool, block_size: int = 16, watermark: float = 0.01) -> None:
+        self.pool = pool
+        self.block_size = block_size
+        self.num_blocks = pool.num_blocks(block_size)  # validates block_size
+        if self.num_blocks == 0:
+            raise ConfigError(f"the KV pool ({pool.total_tokens} token slots) is smaller "
+                              f"than one block of {block_size} tokens")
+        if not 0 <= watermark < 1:
+            raise ConfigError(f"watermark must be in [0, 1), got {watermark!r}")
+        self.watermark_blocks = int(watermark * self.num_blocks)  # as vLLM computes it
+        self.name = f"paged-{block_size}"
+        self._free: list[int] = list(range(self.num_blocks - 1, -1, -1))  # pop() gives block 0 first
+        self._ref_count = [0] * self.num_blocks  # always 0 or 1 until prefix sharing (stretch)
+        self._tables: dict[int, list[int]] = {}
+        self._tokens: dict[int, int] = {}
+
+    # --- helpers ---
+    def blocks_for(self, n_tokens: int) -> int:
+        return math.ceil(n_tokens / self.block_size)
+
+    def _table(self, seq_id: int) -> list[int]:
+        try:
+            return self._tables[seq_id]
+        except KeyError:
+            raise AllocationError(f"request {seq_id} holds no blocks") from None
+
+    def _take(self, n_blocks: int) -> list[int]:
+        taken = [self._free.pop() for _ in range(n_blocks)]
+        for block in taken:
+            self._ref_count[block] = 1
+        return taken
+
+    @staticmethod
+    def _check_count(n: int) -> None:
+        if not isinstance(n, int) or isinstance(n, bool) or n < 1:
+            raise AllocationError(f"token count must be a positive integer, got {n!r}")
+
+    # --- block-level view ---
+    @property
+    def capacity_tokens(self) -> int:
+        return self.num_blocks * self.block_size
+
+    @property
+    def blocks_free(self) -> int:
+        return len(self._free)
+
+    @property
+    def blocks_used(self) -> int:
+        return self.num_blocks - len(self._free)
+
+    @property
+    def block_table_bytes(self) -> int:
+        return BLOCK_TABLE_ENTRY_BYTES * self.blocks_used
+
+    def block_table(self, seq_id: int) -> list[int]:
+        return list(self._table(seq_id))
+
+    # --- admission and growth ---
+    def can_admit(self, seq_id: int, n_tokens: int, request: Request | None = None) -> bool:
+        self._check_count(n_tokens)
+        if seq_id in self._tables:
+            return False
+        # keep a watermark of free blocks so a new request does not force an
+        # eviction on its very next step; growth (append) ignores it
+        return len(self._free) - self.blocks_for(n_tokens) >= self.watermark_blocks
+
+    def admit(self, seq_id: int, n_tokens: int, request: Request | None = None) -> None:
+        if seq_id in self._tables:
+            raise AllocationError(f"request {seq_id} is already admitted")
+        if not self.can_admit(seq_id, n_tokens, request):
+            raise AllocationError(f"not enough free blocks to admit request {seq_id}")
+        self._tables[seq_id] = self._take(self.blocks_for(n_tokens))
+        self._tokens[seq_id] = n_tokens
+
+    def _new_blocks_needed(self, seq_id: int, n: int) -> int:
+        table = self._table(seq_id)  # raises AllocationError for an unknown request
+        return self.blocks_for(self._tokens[seq_id] + n) - len(table)
+
+    def can_append(self, seq_id: int, n: int = 1) -> bool:
+        self._check_count(n)
+        return self._new_blocks_needed(seq_id, n) <= len(self._free)
+
+    def append(self, seq_id: int, n: int = 1) -> None:
+        if not self.can_append(seq_id, n):
+            raise AllocationError(f"no free block for request {seq_id}")
+        self._tables[seq_id].extend(self._take(self._new_blocks_needed(seq_id, n)))
+        self._tokens[seq_id] += n
+
+    def free(self, seq_id: int) -> int:
+        table = self._table(seq_id)
+        for block in table:
+            self._ref_count[block] = 0
+        self._free.extend(reversed(table))  # freed blocks are reused first
+        del self._tables[seq_id], self._tokens[seq_id]
+        return len(table) * self.block_size
+
+    # --- accounting ---
+    def num_tokens(self, seq_id: int) -> int:
+        self._table(seq_id)
+        return self._tokens[seq_id]
+
+    def held_tokens(self, seq_id: int) -> int:
+        return len(self._table(seq_id)) * self.block_size
+
+    def allocated_tokens(self) -> int:
+        return self.blocks_used * self.block_size
+
+    def largest_free_run(self) -> int:
+        return self.free_tokens()
+
+    def __contains__(self, seq_id: int) -> bool:
+        return seq_id in self._tables
+
+    def check_invariants(self) -> None:
+        held = [block for table in self._tables.values() for block in table]
+        everything = held + self._free
+        assert sorted(everything) == list(range(self.num_blocks)), "a block is lost or listed twice"
+        assert all(self._ref_count[b] == 1 for b in held), "held block with ref count != 1"
+        assert all(self._ref_count[b] == 0 for b in self._free), "free block with ref count != 0"
+        assert self._tables.keys() == self._tokens.keys(), "block tables and token counts disagree"
+        for seq_id, table in self._tables.items():
+            tokens = self._tokens[seq_id]
+            assert tokens >= 1 and self.blocks_for(tokens) == len(table), (
+                f"request {seq_id}: {tokens} tokens in {len(table)} blocks")
+        assert self.allocated_tokens() + self.free_tokens() == self.capacity_tokens

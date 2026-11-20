@@ -1,0 +1,66 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="440" viewBox="0 0 720 440" font-family="Segoe UI, Helvetica, Arial, sans-serif">
+<rect width="720" height="440" fill="#ffffff"/>
+<text x="80" y="28" font-size="16" font-weight="600" fill="#111827">LLaMA-7B on A100 80GB</text>
+<line x1="80.0" y1="48" x2="80.0" y2="376" stroke="#e5e7eb"/>
+<text x="80.0" y="394" font-size="11" fill="#6b7280" text-anchor="middle">0.1</text>
+<line x1="158.3" y1="48" x2="158.3" y2="376" stroke="#e5e7eb"/>
+<text x="158.3" y="394" font-size="11" fill="#6b7280" text-anchor="middle">1</text>
+<line x1="236.7" y1="48" x2="236.7" y2="376" stroke="#e5e7eb"/>
+<text x="236.7" y="394" font-size="11" fill="#6b7280" text-anchor="middle">10</text>
+<line x1="315.0" y1="48" x2="315.0" y2="376" stroke="#e5e7eb"/>
+<text x="315.0" y="394" font-size="11" fill="#6b7280" text-anchor="middle">100</text>
+<line x1="393.3" y1="48" x2="393.3" y2="376" stroke="#e5e7eb"/>
+<text x="393.3" y="394" font-size="11" fill="#6b7280" text-anchor="middle">1k</text>
+<line x1="471.7" y1="48" x2="471.7" y2="376" stroke="#e5e7eb"/>
+<text x="471.7" y="394" font-size="11" fill="#6b7280" text-anchor="middle">10k</text>
+<line x1="550.0" y1="48" x2="550.0" y2="376" stroke="#e5e7eb"/>
+<text x="550.0" y="394" font-size="11" fill="#6b7280" text-anchor="middle">100k</text>
+<line x1="80" y1="376.0" x2="550" y2="376.0" stroke="#e5e7eb"/>
+<text x="72" y="380.0" font-size="11" fill="#6b7280" text-anchor="end">100G</text>
+<line x1="80" y1="294.0" x2="550" y2="294.0" stroke="#e5e7eb"/>
+<text x="72" y="298.0" font-size="11" fill="#6b7280" text-anchor="end">1T</text>
+<line x1="80" y1="212.0" x2="550" y2="212.0" stroke="#e5e7eb"/>
+<text x="72" y="216.0" font-size="11" fill="#6b7280" text-anchor="end">10T</text>
+<line x1="80" y1="130.0" x2="550" y2="130.0" stroke="#e5e7eb"/>
+<text x="72" y="134.0" font-size="11" fill="#6b7280" text-anchor="end">100T</text>
+<line x1="80" y1="48.0" x2="550" y2="48.0" stroke="#e5e7eb"/>
+<text x="72" y="52.0" font-size="11" fill="#6b7280" text-anchor="end">1000T</text>
+<rect x="80" y="48" width="470" height="328" fill="none" stroke="#6b7280"/>
+<text x="315.0" y="420" font-size="12" fill="#111827" text-anchor="middle">arithmetic intensity (FLOPs / byte)</text>
+<text transform="translate(20 212.0) rotate(-90)" font-size="12" fill="#111827" text-anchor="middle">FLOP/s</text>
+<polyline points="80.0,350.6 329.5,89.5 550.0,89.5" fill="none" stroke="#111827" stroke-width="2.5"/>
+<line x1="329.5" y1="89.5" x2="329.5" y2="376" stroke="#6b7280" stroke-dasharray="4 4"/>
+<text x="335.5" y="368" font-size="11" fill="#6b7280">ridge 153</text>
+<text x="544.0" y="83.5" font-size="11" fill="#6b7280" text-anchor="end">peak 312T FLOP/s</text>
+<circle cx="158.3" cy="268.6" r="4" fill="#2563eb" fill-opacity="0.75"/>
+<circle cx="158.3" cy="268.6" r="4" fill="#ea580c" fill-opacity="0.75"/>
+<circle cx="180.6" cy="245.3" r="4" fill="#2563eb" fill-opacity="0.75"/>
+<circle cx="181.9" cy="243.9" r="4" fill="#ea580c" fill-opacity="0.75"/>
+<circle cx="201.7" cy="223.2" r="4" fill="#2563eb" fill-opacity="0.75"/>
+<circle cx="205.5" cy="219.3" r="4" fill="#ea580c" fill-opacity="0.75"/>
+<circle cx="220.8" cy="203.2" r="4" fill="#2563eb" fill-opacity="0.75"/>
+<circle cx="229.1" cy="194.6" r="4" fill="#ea580c" fill-opacity="0.75"/>
+<circle cx="236.9" cy="186.3" r="4" fill="#2563eb" fill-opacity="0.75"/>
+<circle cx="252.6" cy="169.9" r="4" fill="#ea580c" fill-opacity="0.75"/>
+<circle cx="249.2" cy="173.5" r="4" fill="#2563eb" fill-opacity="0.75"/>
+<circle cx="276.1" cy="145.3" r="4" fill="#ea580c" fill-opacity="0.75"/>
+<circle cx="257.5" cy="164.8" r="4" fill="#2563eb" fill-opacity="0.75"/>
+<circle cx="299.6" cy="120.7" r="4" fill="#ea580c" fill-opacity="0.75"/>
+<circle cx="262.6" cy="159.5" r="4" fill="#2563eb" fill-opacity="0.75"/>
+<circle cx="323.1" cy="96.2" r="4" fill="#ea580c" fill-opacity="0.75"/>
+<circle cx="265.5" cy="156.5" r="4" fill="#2563eb" fill-opacity="0.75"/>
+<circle cx="346.3" cy="89.5" r="4" fill="#ea580c" fill-opacity="0.75"/>
+<circle cx="252.0" cy="170.6" r="4" fill="#16a34a" fill-opacity="0.75"/>
+<circle cx="299.1" cy="121.3" r="4" fill="#16a34a" fill-opacity="0.75"/>
+<circle cx="346.1" cy="89.5" r="4" fill="#16a34a" fill-opacity="0.75"/>
+<circle cx="392.8" cy="89.5" r="4" fill="#16a34a" fill-opacity="0.75"/>
+<circle cx="438.1" cy="89.5" r="4" fill="#16a34a" fill-opacity="0.75"/>
+<line x1="566" y1="58" x2="588" y2="58" stroke="#111827" stroke-width="2.5"/>
+<text x="594" y="62" font-size="11" fill="#111827">roof</text>
+<line x1="566" y1="78" x2="588" y2="78" stroke="#2563eb" stroke-width="2.5"/>
+<text x="594" y="82" font-size="11" fill="#111827">decode, 1k context</text>
+<line x1="566" y1="98" x2="588" y2="98" stroke="#ea580c" stroke-width="2.5"/>
+<text x="594" y="102" font-size="11" fill="#111827">decode, no context</text>
+<line x1="566" y1="118" x2="588" y2="118" stroke="#16a34a" stroke-width="2.5"/>
+<text x="594" y="122" font-size="11" fill="#111827">prefill</text>
+</svg>

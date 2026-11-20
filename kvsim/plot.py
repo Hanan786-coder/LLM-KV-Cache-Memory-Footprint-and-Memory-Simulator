@@ -159,7 +159,7 @@ def roofline_chart(peak_flops: float, bandwidth: float, points: list[tuple[str, 
     out.append(f'<text x="{x(ridge) + 6:.1f}" y="{HEIGHT - BOTTOM - 8}" font-size="11" fill="{MUTED}">'
                f'ridge {ridge:.0f}</text>')
     out.append(f'<text x="{x(x.hi) - 6:.1f}" y="{y(peak_flops) - 6:.1f}" font-size="11" fill="{MUTED}" '
-               f'text-anchor="end">peak {_fmt(peak_flops)}FLOP/s</text>')
+               f'text-anchor="end">peak {_fmt(peak_flops)} FLOP/s</text>')
     colors: dict[str, str] = {}
     for label, inten, perf in points:
         if inten <= 0 or perf <= 0:

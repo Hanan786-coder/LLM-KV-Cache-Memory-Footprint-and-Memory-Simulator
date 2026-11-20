@@ -189,9 +189,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--batches", type=_int_list, default=[1, 8, 32])
     p.set_defaults(func=cmd_sweep)
 
-    from . import cli_sim  # Part 2: workload, simulate, compare, blocksweep
+    from . import cli_sim  # workload, simulate, compare, blocksweep, sessions
     cli_sim.register(sub, out=out, gpu=gpu)
-    from . import cli_perf  # Part 3: roofline, scaling, profile
+    from . import cli_perf  # roofline, scaling, profile
     cli_perf.register(sub, out=out, gpu=gpu)
     return parser
 

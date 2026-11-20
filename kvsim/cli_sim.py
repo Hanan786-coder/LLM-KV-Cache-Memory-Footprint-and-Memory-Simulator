@@ -284,7 +284,7 @@ def _engine_parent() -> argparse.ArgumentParser:
 def _trace_parent() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(add_help=False)
     g = p.add_argument_group("output")
-    g.add_argument("--steps-csv", metavar="FILE", help="write the per-step trace (the Part 3 input)")
+    g.add_argument("--steps-csv", metavar="FILE", help="write the per-step trace (input of `profile --from-steps`)")
     g.add_argument("--requests-csv", metavar="FILE", help="write the per-request trace")
     return p
 
@@ -299,7 +299,7 @@ def register(sub, out: argparse.ArgumentParser, gpu: argparse.ArgumentParser) ->
     p.set_defaults(func=cmd_workload)
 
     p = sub.add_parser("simulate", parents=[sim, gpu, workload, engine, traces, out],
-                       help="simulate KV-cache allocation step by step (Part 2)")
+                       help="simulate KV-cache allocation step by step")
     p.add_argument("--timeline", type=int, default=10, help="steps to show in the terminal (default 10)")
     p.set_defaults(func=cmd_simulate)
 

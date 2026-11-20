@@ -149,7 +149,7 @@ def cmd_sweep(args) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="kvsim", description="LLM KV-cache memory footprint calculator and allocation simulator.")
+        prog="kvsim", description="LLM KV-cache memory footprint, allocation and bandwidth simulator.")
     sub = parser.add_subparsers(dest="command", required=True)
 
     out = argparse.ArgumentParser(add_help=False)
@@ -191,6 +191,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     from . import cli_sim  # Part 2: workload, simulate, compare, blocksweep
     cli_sim.register(sub, out=out, gpu=gpu)
+    from . import cli_perf  # Part 3: roofline, scaling, profile
+    cli_perf.register(sub, out=out, gpu=gpu)
     return parser
 
 

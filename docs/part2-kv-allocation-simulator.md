@@ -221,7 +221,7 @@ line and in code:
 
 | Spec | Meaning |
 |---|---|
-| `fixed:N` | always `N` |
+| `N` or `fixed:N` | always `N` |
 | `uniform:LO:HI` | integer uniform in `[LO, HI]` |
 | `lognormal:MEAN:SIGMA[:LO:HI]` | log-normal with the given mean, clipped to `[LO, HI]`; uses `random.lognormvariate(mu, SIGMA)` with `mu = ln(MEAN) - SIGMA^2 / 2` |
 
@@ -243,6 +243,9 @@ are set so that `chat` has about 8.4x longer prompts and 5.8x longer outputs tha
 * **Clipping:** generated output lengths are clipped so that `P + O <= max_model_len`
   and `O <= max_new_tokens`. The generator reports how many requests were clipped.
 * **Seed:** `--seed` (default 0). The same seed always gives the same requests.
+  Prompt lengths, output lengths and arrival gaps use three separate random streams,
+  so changing one setting (for example the arrival rate in E4) leaves the other two
+  exactly as they were.
 
 ### 7.3 Trace files
 
@@ -263,16 +266,25 @@ workload in the same format.
 ### 7.4 API
 
 ```python
-from kvsim.workload import Request, generate_requests, load_trace, save_trace, PRESETS
+from kvsim.workload import (generate_workload, generate_requests, load_trace, save_trace,
+                            validate_requests, workload_stats, parse_length_spec, PRESETS)
 
-# signature: generate_requests(n, *, preset=None, prompt=None, output=None, max_model_len,
-#                              max_new_tokens=None, arrival_rate=None, seed=0) -> list[Request]
-reqs = generate_requests(500, preset="chat", max_model_len=2048, seed=1)
-reqs = generate_requests(500, prompt="uniform:16:512", output="fixed:256",   # explicit specs
+# generate_workload(n, *, preset=None, prompt=None, output=None, max_model_len,
+#                   max_new_tokens=None, arrival_rate=None, seed=0) -> GeneratedWorkload
+w = generate_workload(500, preset="chat", max_model_len=2048, seed=1)
+w.requests, w.clipped          # list[Request], and how many were clipped to fit
+reqs = generate_requests(500, prompt="uniform:16:512", output="fixed:256",   # just the list
                          max_model_len=2048, arrival_rate=0.5, seed=1)
+
+save_trace(reqs, "trace.csv")
+reqs = load_trace("trace.csv", max_model_len=2048)   # validated, sorted by (arrival_step, id)
+workload_stats(reqs)           # rows of min / mean / p50 / p95 / max per length
 ```
 
-`prompt` and `output` override the preset's values when both are given.
+`prompt` or `output` replace the preset's distribution for that one length.
+`Request` also has `total_len` (`P + O`), `peak_kv_tokens` (`P + O - 1`) and
+`new_token_limit(max_model_len)`. `percentile(values, p)` uses the nearest-rank
+method, and the simulator's p50/p95 latencies will use the same function.
 
 ## 8. The KV memory pool
 

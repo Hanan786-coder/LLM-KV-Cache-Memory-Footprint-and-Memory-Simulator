@@ -74,3 +74,12 @@ class TestGPUConfig(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestGPUPcie(unittest.TestCase):
+    def test_pcie_defaults_to_pcie4_and_profiles_set_it(self):
+        gpu = GPUConfig(name="g", memory_gib=8, bandwidth_gbs=500, peak_fp16_tflops=50)
+        self.assertEqual(gpu.pcie_bytes_per_s, 32e9)
+        self.assertEqual(load_gpu("h100-sxm").pcie_gbs, 64)
+        with self.assertRaises(ConfigError):
+            GPUConfig(name="g", memory_gib=8, bandwidth_gbs=500, peak_fp16_tflops=50, pcie_gbs=0)

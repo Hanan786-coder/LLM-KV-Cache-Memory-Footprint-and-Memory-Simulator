@@ -100,9 +100,10 @@ class GPUConfig:
     bandwidth_gbs: float  # decimal GB/s, as on datasheets
     peak_fp16_tflops: float  # dense tensor-core throughput
     peak_int8_tops: float | None = None
+    pcie_gbs: float = 32.0  # host link per direction (PCIe 4.0 x16), used for KV swap
 
     def __post_init__(self) -> None:
-        for name in ("memory_gib", "bandwidth_gbs", "peak_fp16_tflops"):
+        for name in ("memory_gib", "bandwidth_gbs", "peak_fp16_tflops", "pcie_gbs"):
             value = getattr(self, name)
             if not isinstance(value, (int, float)) or value <= 0:
                 raise ConfigError(f"GPUConfig.{name} must be a positive number, got {value!r}")
@@ -114,6 +115,10 @@ class GPUConfig:
     @property
     def bandwidth_bytes_per_s(self) -> float:
         return self.bandwidth_gbs * 1e9
+
+    @property
+    def pcie_bytes_per_s(self) -> float:
+        return self.pcie_gbs * 1e9
 
     @property
     def ridge_point(self) -> float:

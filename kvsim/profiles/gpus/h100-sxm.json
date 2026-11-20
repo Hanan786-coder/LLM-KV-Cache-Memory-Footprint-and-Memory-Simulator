@@ -3,5 +3,6 @@
   "memory_gib": 80,
   "bandwidth_gbs": 3350,
   "peak_fp16_tflops": 989.4,
-  "peak_int8_tops": 1978.9
+  "peak_int8_tops": 1978.9,
+  "pcie_gbs": 64
 }

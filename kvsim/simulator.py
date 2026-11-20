@@ -23,7 +23,8 @@ from dataclasses import asdict, dataclass, fields
 from enum import Enum
 
 from .allocator import ContiguousAllocator, KVAllocator, PagedAllocator
-from .config import ConfigError
+from .config import GIB, ConfigError
+from .eviction import PREEMPT_MODES, VICTIM_POLICIES, SwapSpace, choose_victim
 from .kvpool import DEFAULT_MAX_NUM_SEQS, KVPool
 from .workload import Request, percentile, validate_requests
 
@@ -46,14 +47,19 @@ class SimConfig:
     max_num_seqs: int = DEFAULT_MAX_NUM_SEQS  # most requests running at once
     max_batched_tokens: int = 2048  # prompt tokens per prefill step (Part 1's prefill_chunk)
     max_model_len: int = 2048  # longest prompt + output; use the model's max_context
+    evict_policy: str = "lifo"  # lifo | fifo | largest
+    preempt_mode: str = "recompute"  # recompute | swap
+    swap_bytes: int = 4 * GIB  # CPU swap space (vLLM's default swap_space)
     max_steps: int = 10_000_000  # safety stop
     check_invariants: bool = False  # verify allocator and accounting after every step (tests)
 
     def __post_init__(self) -> None:
-        if self.allocator not in ALLOCATORS:
-            raise ConfigError(f"unknown allocator {self.allocator!r}; choose from {', '.join(ALLOCATORS)}")
-        if self.batching not in BATCHING:
-            raise ConfigError(f"unknown batching {self.batching!r}; choose from {', '.join(BATCHING)}")
+        for name, allowed in (("allocator", ALLOCATORS), ("batching", BATCHING),
+                              ("evict_policy", VICTIM_POLICIES), ("preempt_mode", PREEMPT_MODES)):
+            if getattr(self, name) not in allowed:
+                raise ConfigError(f"unknown {name} {getattr(self, name)!r}; choose from {', '.join(allowed)}")
+        if not isinstance(self.swap_bytes, int) or self.swap_bytes < 0:
+            raise ConfigError(f"swap_bytes must be a non-negative integer, got {self.swap_bytes!r}")
         for name, low in (("block_size", 1), ("max_num_seqs", 1), ("max_batched_tokens", 1),
                           ("max_model_len", 2), ("max_steps", 1)):
             value = getattr(self, name)
@@ -70,6 +76,7 @@ def make_allocator(config: SimConfig, pool: KVPool) -> KVAllocator:
 class Status(Enum):
     WAITING = "waiting"
     RUNNING = "running"
+    SWAPPED = "swapped"
     FINISHED = "finished"
     REJECTED = "rejected"
 
@@ -89,7 +96,8 @@ class Sequence:
     finish_step: int | None = None
     preemptions: int = 0
     recompute_tokens: int = 0
-    swap_bytes: int = 0
+    swap_bytes: int = 0  # bytes moved over PCIe, both directions
+    swapped_tokens: int = 0  # slots it occupies in swap space while SWAPPED
     peak_kv_tokens: int = 0
     peak_held_tokens: int = 0
 
@@ -160,8 +168,9 @@ REQUEST_COLUMNS = (
 
 class SimResult:
     def __init__(self, config: SimConfig, allocator: KVAllocator, steps: list[StepStats],
-                 sequences: list[Sequence]) -> None:
+                 sequences: list[Sequence], swap_fallbacks: int = 0) -> None:
         self.config = config
+        self.swap_fallbacks = swap_fallbacks  # swaps that became recomputes (swap space full)
         self.allocator_name = allocator.name
         self.bytes_per_token = allocator.pool.bytes_per_token
         self.capacity_tokens = allocator.capacity_tokens
@@ -237,6 +246,7 @@ class SimResult:
             "recompute_tokens": sum(s.recompute_tokens for s in steps),
             "swap_out_bytes": sum(s.swap_out_bytes for s in steps),
             "swap_in_bytes": sum(s.swap_in_bytes for s in steps),
+            "swap_fallbacks": self.swap_fallbacks,
             "queue_p50": pct("queue_steps", 50), "queue_p95": pct("queue_steps", 95),
             "ttft_p50": pct("ttft_steps", 50), "ttft_p95": pct("ttft_steps", 95),
             "e2e_p50": pct("e2e_steps", 50), "e2e_p95": pct("e2e_steps", 95),
@@ -261,21 +271,30 @@ class Simulator:
         self.pending = deque(self.sequences)  # not arrived yet
         self.waiting: deque[Sequence] = deque()  # arrived, FCFS
         self.running: list[Sequence] = []  # hold GPU memory, kept in priority order
+        self.swapped: list[Sequence] = []  # KV in CPU swap space, kept in priority order
+        self.swap = SwapSpace(config.swap_bytes // pool.bytes_per_token)
+        self.swap_fallbacks = 0
         self.steps: list[StepStats] = []
         self.now = 0
 
     # --- main loop ---
     def run(self) -> SimResult:
-        while self.pending or self.waiting or self.running:
+        while self.pending or self.waiting or self.running or self.swapped:
             if len(self.steps) >= self.config.max_steps:
                 raise SimulationError(f"stopped after {self.config.max_steps} steps")
             self._arrivals()
-            if not (self.waiting or self.running):  # idle: jump to the next arrival
+            if not (self.waiting or self.running or self.swapped):  # idle: jump to the next arrival
                 self.now = self.pending[0].request.arrival_step
                 continue
             self._step()
             self.now += 1
-        return SimResult(self.config, self.alloc, self.steps, self.sequences)
+        return SimResult(self.config, self.alloc, self.steps, self.sequences, self.swap_fallbacks)
+
+    @staticmethod
+    def _insert(queue: list | deque, seq: Sequence) -> None:
+        """Insert keeping ``queue`` in priority order."""
+        keys = [s.key for s in queue]
+        queue.insert(bisect.bisect(keys, seq.key), seq)
 
     def _arrivals(self) -> None:
         while self.pending and self.pending[0].request.arrival_step <= self.now:
@@ -288,14 +307,13 @@ class Simulator:
     def _fits_alone(self, seq: Sequence) -> bool:
         """Could this request run to completion in an otherwise empty pool?"""
         a = self.alloc
-        if isinstance(a, PagedAllocator):
-            usable = a.num_blocks - a.watermark_blocks  # admission keeps the watermark free
-            return (a.blocks_for(seq.request.prompt_len) <= usable
-                    and a.blocks_for(seq.final_tokens) <= a.num_blocks)
+        if isinstance(a, PagedAllocator):  # the watermark is waived when nothing else runs
+            return a.blocks_for(seq.final_tokens) <= a.num_blocks
         return a.reservation_for(seq.request) <= a.capacity_tokens
 
     def _step(self) -> None:
         c = _StepCounters()
+        self._swap_in(c)
         self._admit(c)
         prefilling = [s for s in self.running if s.prefill_remaining]
         if prefilling:
@@ -313,26 +331,46 @@ class Simulator:
         self._record(phase, c)
 
     # --- scheduling ---
+    def _swap_in(self, c: _StepCounters) -> None:
+        """Bring swapped requests back, oldest first, while blocks are free."""
+        while self.swapped and len(self.running) < self.config.max_num_seqs:
+            seq = self.swapped[0]
+            # room for its cache plus the next token, so it is not evicted again at once
+            if not self.alloc.can_admit(seq.id, seq.kv_len + 1, reserve_watermark=False):
+                break
+            self.swapped.pop(0)
+            self.alloc.admit(seq.id, seq.kv_len, reserve_watermark=False)
+            self.swap.release(seq.swapped_tokens)
+            c.swap_in += seq.swapped_tokens
+            seq.swap_bytes += seq.swapped_tokens * self.alloc.pool.bytes_per_token
+            seq.swapped_tokens = 0
+            seq.status = Status.RUNNING
+            self._insert(self.running, seq)
+
     def _admit(self, c: _StepCounters) -> None:
+        if self.swapped:  # preempted requests go before new ones
+            return
         if self.config.batching == "static" and self.running:
             return
         budget = self.config.max_batched_tokens - sum(s.prefill_remaining for s in self.running)
         while self.waiting and budget > 0 and len(self.running) < self.config.max_num_seqs:
             seq = self.waiting[0]
-            n = seq.request.prompt_len
-            if not self.alloc.can_admit(seq.id, n, seq.request):
+            # a new request prefills its prompt; a recomputed one prefills everything it
+            # knew: prompt + generated tokens (P + g), which rebuilds its cache
+            n = seq.request.prompt_len + seq.generated
+            watermark = bool(self.running)  # waived when nothing else is running
+            if not self.alloc.can_admit(seq.id, n, seq.request, reserve_watermark=watermark):
                 c.admission_stall = 1
                 if isinstance(self.alloc, ContiguousAllocator):
                     c.frag_stall = int(self.alloc.free_tokens() >= self.alloc.reservation_for(seq.request))
                 break
             self.waiting.popleft()
-            self.alloc.admit(seq.id, n, seq.request)
+            self.alloc.admit(seq.id, n, seq.request, reserve_watermark=watermark)
             seq.status = Status.RUNNING
             seq.prefill_target, seq.prefill_done = n, 0
             if seq.admitted_step is None:
                 seq.admitted_step = self.now
-            keys = [s.key for s in self.running]
-            self.running.insert(bisect.bisect(keys, seq.key), seq)
+            self._insert(self.running, seq)
             budget -= min(n, budget)
             c.admitted += 1
 
@@ -384,12 +422,31 @@ class Simulator:
                 c.batch_size += 1
 
     def _choose_victim(self, needy: Sequence) -> Sequence:
-        raise SimulationError(
-            f"step {self.now}: request {needy.id} needs a new block but the pool is full; "
-            "preemption is not implemented yet (milestone M5)")
+        return choose_victim(self.config.evict_policy, self.running, self.alloc.held_tokens)
 
     def _preempt(self, victim: Sequence, c: _StepCounters) -> None:
-        raise SimulationError("preemption is not implemented yet (milestone M5)")
+        """Evict all of ``victim``'s blocks: swap them out, or drop them to recompute later."""
+        held = self.alloc.held_tokens(victim.id)
+        self.alloc.free(victim.id)  # also drops a slot it may have claimed this step
+        self.running.remove(victim)
+        victim.preemptions += 1
+        c.preempted += 1
+        if self.config.preempt_mode == "swap":
+            if self.swap.can_hold(held):
+                self.swap.store(held)
+                victim.swapped_tokens = held
+                victim.swap_bytes += held * self.alloc.pool.bytes_per_token
+                victim.status = Status.SWAPPED
+                c.swap_out += held
+                self._insert(self.swapped, victim)
+                return
+            self.swap_fallbacks += 1  # swap space is full: recompute instead
+        victim.recompute_tokens += victim.kv_len
+        c.recompute_tokens += victim.kv_len
+        victim.kv_len = 0
+        victim.prefill_target = victim.prefill_done = 0
+        victim.status = Status.WAITING
+        self._insert(self.waiting, victim)  # front of the queue: it arrived before the rest
 
     def _finish(self, c: _StepCounters) -> None:
         still_running = []
@@ -423,7 +480,7 @@ class Simulator:
             assert all(s.kv_len <= a.num_tokens(s.id) for s in self.running)
         self.steps.append(StepStats(
             step=self.now, phase=phase, batch_size=c.batch_size, running=len(self.running),
-            waiting=len(self.waiting), swapped=0, prefill_tokens=c.prefill_tokens,
+            waiting=len(self.waiting), swapped=len(self.swapped), prefill_tokens=c.prefill_tokens,
             output_tokens=c.output_tokens, kv_tokens=used, kv_used_bytes=used * bpt,
             kv_read_bytes=c.kv_read * bpt, kv_write_bytes=c.kv_write * bpt,
             attention_pairs=c.attention_pairs, kv_allocated_bytes=allocated * bpt,
@@ -436,7 +493,7 @@ class Simulator:
             admitted=c.admitted, finished=c.finished, preempted=c.preempted,
             overflow_events=c.overflow_events, admission_stall=c.admission_stall,
             frag_stall=c.frag_stall, swap_out_bytes=c.swap_out * bpt, swap_in_bytes=c.swap_in * bpt,
-            swap_used_bytes=0, recompute_tokens=c.recompute_tokens,
+            swap_used_bytes=self.swap.used_tokens * bpt, recompute_tokens=c.recompute_tokens,
         ))
 
 

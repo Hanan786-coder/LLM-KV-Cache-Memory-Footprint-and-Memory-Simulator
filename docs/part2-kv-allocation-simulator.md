@@ -383,7 +383,9 @@ raises `AllocationError`. The scheduler always checks first.
 * **Admit `n` tokens:** needs `ceil(n / B)` blocks. Admission also keeps a
   **watermark** of free blocks (`--watermark`, default 1% of blocks, as in vLLM v0),
   so that a new request does not cause a preemption on its very next step.
-  Growth (`append`) ignores the watermark.
+  Growth (`append`) ignores the watermark, and so do swap-ins and admissions while
+  nothing else is running (otherwise a request that needs almost the whole pool
+  could wait forever).
 * **Append 1 token:** needs a new block only when the request's last block is full.
 * **Free:** pushes all of the request's blocks back on the free list.
 * **External fragmentation is zero by construction:** any free block can serve any
@@ -602,8 +604,9 @@ Ties are broken by arrival step, then request id.
   `recompute_tokens += L`.
 * **`swap`:** copy the victim's blocks to CPU swap space
   (`swap_out_bytes += blocks x block_bytes`) and move it to `swapped`. A swapped
-  request is copied back before any new admissions, as soon as there are enough free
-  blocks (`swap_in_bytes`). The bytes are reported so that Part 3 can turn them into
+  request is copied back before any new admissions, as soon as there are free
+  blocks for its cache plus its next token, so it is not evicted again at once
+  (`swap_in_bytes`). It then carries on decoding with no second prefill. The bytes are reported so that Part 3 can turn them into
   PCIe time. If swap space is full, the victim falls back to recompute, which is
   counted.
 * The vLLM paper found recompute cheaper with small blocks and swap cheaper with
@@ -675,7 +678,7 @@ steps. Also preemptions, tokens recomputed, bytes swapped, and peak KV held.
 | `avg_decode_batch`, `peak_running` | mean batch size over decode steps; most requests running at once |
 | `tokens_per_step` | output tokens / steps (a throughput proxy until Part 3 adds time) |
 | `preemptions`, `overflow_events`, `admission_stalls`, `frag_stalls` | counts |
-| `recompute_tokens`, `swap_out_bytes`, `swap_in_bytes` | eviction cost |
+| `recompute_tokens`, `swap_out_bytes`, `swap_in_bytes`, `swap_fallbacks` | eviction cost (`swap_fallbacks`: swaps that became recomputes because swap space was full) |
 | `queue_p50/p95`, `ttft_p50/p95`, `e2e_p50/p95` | per-request latencies in steps |
 
 Averages are taken over recorded (busy) steps with equal weight. Prefill and decode
@@ -840,6 +843,11 @@ numbers):
   near-zero waste). First result at M4 (500 `chat` requests on an RTX 4090):
   `contig-max` 24.9%, `contig-pow2` 39.0%, `contig-oracle` 50.1%, inside or near
   the paper's range.
+* First full paged result at M5, on the same workload: `paged-16` keeps token states
+  in 98.6% of its memory, averages 34.2 requests per decode step against 9.8 for
+  `contig-max`, and needs 4,909 steps against 16,813 (about 3.4x fewer, in line with
+  the paper's 2-4x). LIFO recomputes the fewest tokens (80,200 against 127,068 for
+  FIFO), and largest-first evicts least often (92 preemptions against 384 for LIFO).
 * Very short requests (20-100 tokens) bring `paged-16` down to about 86%, because a
   half-empty 16-token block is a large share of each one. 4-token blocks give about
   97%. This is the paper's observation that large blocks hurt short sequences.

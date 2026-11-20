@@ -43,11 +43,17 @@ class KVAllocator(ABC):
 
     # --- admission and growth ---
     @abstractmethod
-    def can_admit(self, seq_id: int, n_tokens: int, request: Request | None = None) -> bool:
-        """Whether a new request can claim its first ``n_tokens`` slots now."""
+    def can_admit(self, seq_id: int, n_tokens: int, request: Request | None = None,
+                  reserve_watermark: bool = True) -> bool:
+        """Whether a new request can claim its first ``n_tokens`` slots now.
+
+        ``reserve_watermark=False`` lets the paged allocator use its last free blocks
+        (for swap-ins, and when nothing else is running).
+        """
 
     @abstractmethod
-    def admit(self, seq_id: int, n_tokens: int, request: Request | None = None) -> None:
+    def admit(self, seq_id: int, n_tokens: int, request: Request | None = None,
+              reserve_watermark: bool = True) -> None:
         """Claim slots for a new request's first ``n_tokens`` tokens (its prompt)."""
 
     @abstractmethod
@@ -156,18 +162,21 @@ class PagedAllocator(KVAllocator):
         return list(self._table(seq_id))
 
     # --- admission and growth ---
-    def can_admit(self, seq_id: int, n_tokens: int, request: Request | None = None) -> bool:
+    def can_admit(self, seq_id: int, n_tokens: int, request: Request | None = None,
+                  reserve_watermark: bool = True) -> bool:
         self._check_count(n_tokens)
         if seq_id in self._tables:
             return False
         # keep a watermark of free blocks so a new request does not force an
         # eviction on its very next step; growth (append) ignores it
-        return len(self._free) - self.blocks_for(n_tokens) >= self.watermark_blocks
+        keep = self.watermark_blocks if reserve_watermark else 0
+        return len(self._free) - self.blocks_for(n_tokens) >= keep
 
-    def admit(self, seq_id: int, n_tokens: int, request: Request | None = None) -> None:
+    def admit(self, seq_id: int, n_tokens: int, request: Request | None = None,
+              reserve_watermark: bool = True) -> None:
         if seq_id in self._tables:
             raise AllocationError(f"request {seq_id} is already admitted")
-        if not self.can_admit(seq_id, n_tokens, request):
+        if not self.can_admit(seq_id, n_tokens, request, reserve_watermark):
             raise AllocationError(f"not enough free blocks to admit request {seq_id}")
         self._tables[seq_id] = self._take(self.blocks_for(n_tokens))
         self._tokens[seq_id] = n_tokens
@@ -322,11 +331,13 @@ class ContiguousAllocator(KVAllocator):
         return size
 
     # --- admission and growth ---
-    def can_admit(self, seq_id: int, n_tokens: int, request: Request | None = None) -> bool:
+    def can_admit(self, seq_id: int, n_tokens: int, request: Request | None = None,
+                  reserve_watermark: bool = True) -> bool:  # no watermark here
         size = self._size_for(n_tokens, request)
         return seq_id not in self._regions and self._find_hole(size) is not None
 
-    def admit(self, seq_id: int, n_tokens: int, request: Request | None = None) -> None:
+    def admit(self, seq_id: int, n_tokens: int, request: Request | None = None,
+              reserve_watermark: bool = True) -> None:
         if seq_id in self._regions:
             raise AllocationError(f"request {seq_id} is already admitted")
         size = self._size_for(n_tokens, request)

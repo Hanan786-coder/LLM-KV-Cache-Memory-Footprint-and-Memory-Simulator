@@ -6,7 +6,8 @@ holds (``held_tokens``). Held minus claimed is slack the request cannot use yet.
 
 * ``PagedAllocator`` -- vLLM's PagedAttention: fixed-size blocks of ``block_size``
   tokens, a block table per request and a free block list.
-* ``ContiguousAllocator`` -- one reservation per request (added in milestone M3).
+* ``ContiguousAllocator`` -- one reservation per request in a single address
+  space, placed first-fit or best-fit; sized like the vLLM paper's Orca baselines.
 
 Requests are identified by an integer ``seq_id``. All sizes are in token slots;
 multiply by ``pool.bytes_per_token`` for bytes.
@@ -14,6 +15,7 @@ multiply by ``pool.bytes_per_token`` for bytes.
 
 from __future__ import annotations
 
+import bisect
 import math
 from abc import ABC, abstractmethod
 
@@ -221,3 +223,179 @@ class PagedAllocator(KVAllocator):
             assert tokens >= 1 and self.blocks_for(tokens) == len(table), (
                 f"request {seq_id}: {tokens} tokens in {len(table)} blocks")
         assert self.allocated_tokens() + self.free_tokens() == self.capacity_tokens
+
+
+# --- contiguous allocation ----------------------------------------------------
+
+RESERVATIONS = ("max", "request", "pow2", "oracle")
+FITS = ("first", "best")
+
+
+def next_power_of_two(n: int) -> int:
+    return 1 << (n - 1).bit_length()
+
+
+def reservation_tokens(request: Request, strategy: str, max_model_len: int) -> int:
+    """Slots a contiguous allocator reserves for ``request`` (vLLM paper, Sec. 6.1).
+
+    max     -- the model's maximum length (Orca Max, FasterTransformer)
+    request -- prompt + the client's max_new_tokens
+    pow2    -- prompt + true output length rounded up to a power of two (Orca Pow2)
+    oracle  -- exactly the peak, prompt + output - 1 (Orca Oracle)
+    """
+    if strategy == "max":
+        size = max_model_len
+    elif strategy == "request":
+        size = request.prompt_len + request.new_token_limit(max_model_len)
+    elif strategy == "pow2":
+        size = request.prompt_len + next_power_of_two(request.output_len)
+    elif strategy == "oracle":
+        size = request.peak_kv_tokens
+    else:
+        raise ConfigError(f"unknown reservation {strategy!r}; choose from {', '.join(RESERVATIONS)}")
+    return min(size, max_model_len)
+
+
+class ContiguousAllocator(KVAllocator):
+    """One region per request in a single address space of token slots.
+
+    The region is reserved at admission and never grows, so a running request can
+    always append. Freed regions become holes that merge with their neighbours. A
+    request can be blocked even when enough memory is free in total, because no
+    single hole is big enough: external fragmentation.
+    """
+
+    def __init__(self, pool: KVPool, max_model_len: int, reservation: str = "max",
+                 fit: str = "first") -> None:
+        if reservation not in RESERVATIONS:
+            raise ConfigError(f"unknown reservation {reservation!r}; choose from {', '.join(RESERVATIONS)}")
+        if fit not in FITS:
+            raise ConfigError(f"unknown fit {fit!r}; choose from {', '.join(FITS)}")
+        if not isinstance(max_model_len, int) or isinstance(max_model_len, bool) or max_model_len < 2:
+            raise ConfigError(f"max_model_len must be an integer >= 2, got {max_model_len!r}")
+        if pool.total_tokens == 0:
+            raise ConfigError("the KV pool has no token slots")
+        self.pool = pool
+        self.max_model_len = max_model_len
+        self.reservation = reservation
+        self.fit = fit
+        self.name = f"contig-{reservation}" + ("-best" if fit == "best" else "")
+        self._hole_starts: list[int] = [0]  # sorted addresses of free regions
+        self._hole_sizes: dict[int, int] = {0: pool.total_tokens}
+        self._regions: dict[int, tuple[int, int]] = {}  # seq_id -> (start, size)
+        self._tokens: dict[int, int] = {}
+        self._allocated = 0
+
+    @property
+    def capacity_tokens(self) -> int:
+        return self.pool.total_tokens
+
+    def reservation_for(self, request: Request) -> int:
+        return reservation_tokens(request, self.reservation, self.max_model_len)
+
+    def holes(self) -> list[tuple[int, int]]:
+        """Free regions as (start, size), in address order."""
+        return [(s, self._hole_sizes[s]) for s in self._hole_starts]
+
+    def region(self, seq_id: int) -> tuple[int, int]:
+        try:
+            return self._regions[seq_id]
+        except KeyError:
+            raise AllocationError(f"request {seq_id} holds no region") from None
+
+    def _find_hole(self, size: int) -> int | None:
+        fitting = [s for s in self._hole_starts if self._hole_sizes[s] >= size]
+        if not fitting:
+            return None
+        if self.fit == "first":
+            return fitting[0]
+        return min(fitting, key=lambda s: (self._hole_sizes[s], s))  # smallest, then lowest address
+
+    def _size_for(self, n_tokens: int, request: Request | None) -> int:
+        PagedAllocator._check_count(n_tokens)
+        if request is None:
+            raise AllocationError("the contiguous allocator needs the request to size its reservation")
+        size = self.reservation_for(request)
+        if n_tokens > size:
+            raise AllocationError(f"request {request.id}: {n_tokens} tokens do not fit "
+                                  f"its {size}-slot reservation")
+        return size
+
+    # --- admission and growth ---
+    def can_admit(self, seq_id: int, n_tokens: int, request: Request | None = None) -> bool:
+        size = self._size_for(n_tokens, request)
+        return seq_id not in self._regions and self._find_hole(size) is not None
+
+    def admit(self, seq_id: int, n_tokens: int, request: Request | None = None) -> None:
+        if seq_id in self._regions:
+            raise AllocationError(f"request {seq_id} is already admitted")
+        size = self._size_for(n_tokens, request)
+        start = self._find_hole(size)
+        if start is None:
+            raise AllocationError(f"no hole of {size} slots for request {seq_id}")
+        hole = self._hole_sizes.pop(start)
+        self._hole_starts.remove(start)
+        if hole > size:  # the rest of the hole stays free
+            bisect.insort(self._hole_starts, start + size)
+            self._hole_sizes[start + size] = hole - size
+        self._regions[seq_id] = (start, size)
+        self._tokens[seq_id] = n_tokens
+        self._allocated += size
+
+    def can_append(self, seq_id: int, n: int = 1) -> bool:
+        PagedAllocator._check_count(n)
+        size = self.region(seq_id)[1]
+        return self._tokens[seq_id] + n <= size
+
+    def append(self, seq_id: int, n: int = 1) -> None:
+        if not self.can_append(seq_id, n):
+            raise AllocationError(f"request {seq_id} has filled its reservation")
+        self._tokens[seq_id] += n
+
+    def free(self, seq_id: int) -> int:
+        start, size = self.region(seq_id)
+        del self._regions[seq_id], self._tokens[seq_id]
+        self._allocated -= size
+        freed = size
+        i = bisect.bisect_left(self._hole_starts, start)
+        if i < len(self._hole_starts) and self._hole_starts[i] == start + size:  # merge with next hole
+            size += self._hole_sizes.pop(self._hole_starts.pop(i))
+        if i > 0:
+            prev = self._hole_starts[i - 1]
+            if prev + self._hole_sizes[prev] == start:  # merge with previous hole
+                self._hole_sizes[prev] += size
+                return freed
+        self._hole_starts.insert(i, start)
+        self._hole_sizes[start] = size
+        return freed
+
+    # --- accounting ---
+    def num_tokens(self, seq_id: int) -> int:
+        self.region(seq_id)
+        return self._tokens[seq_id]
+
+    def held_tokens(self, seq_id: int) -> int:
+        return self.region(seq_id)[1]
+
+    def allocated_tokens(self) -> int:
+        return self._allocated
+
+    def largest_free_run(self) -> int:
+        return max(self._hole_sizes.values(), default=0)
+
+    def __contains__(self, seq_id: int) -> bool:
+        return seq_id in self._regions
+
+    def check_invariants(self) -> None:
+        holes = self.holes()
+        assert self._hole_starts == sorted(self._hole_sizes), "hole index out of sync"
+        position = 0
+        for start, size in sorted(holes + list(self._regions.values())):
+            assert size > 0 and start == position, f"gap or overlap at slot {position}"
+            position += size
+        assert position == self.capacity_tokens, "address space not fully covered"
+        for (s1, n1), (s2, _) in zip(holes, holes[1:]):
+            assert s1 + n1 < s2, f"holes at {s1} and {s2} should have been merged"
+        assert self._allocated == sum(size for _, size in self._regions.values())
+        for seq_id, (_, size) in self._regions.items():
+            assert 1 <= self._tokens[seq_id] <= size, f"request {seq_id} overflows its region"

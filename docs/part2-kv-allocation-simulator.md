@@ -11,7 +11,7 @@ milestone ends in a commit with all tests passing.
 | Builds on | Part 1: `kv_bytes_per_token`, `Scenario`, `memory_budget` |
 | Feeds | Part 3: KV-cache size, KV bytes read and written, and batch size at every step |
 | Language | Python 3.10+, standard library only (same as Part 1) |
-| Status | Design agreed. Implementation follows the milestones in section 17. |
+| Status | Implemented: milestones M0-M9 are all committed. Results are in [`part2-results.md`](part2-results.md). |
 
 ## Contents
 
@@ -142,8 +142,8 @@ miss rates. This is where LRU means something (section 11.6).
 
 **Stretch (only if time allows):** a buddy allocator (the vLLM paper models Orca
 with one [1, Sec. 6.1]), prefix sharing with copy-on-write for parallel sampling,
-mixed prefill+decode steps (chunked prefill that piggybacks on decode), and Belady's
-optimal policy as a bound for M9.
+and mixed prefill+decode steps (chunked prefill that piggybacks on decode). Belady's
+optimal policy (OPT) was planned as a stretch goal but is built into M9.
 
 **Out of scope:** time in seconds (Part 3), the effect of a sliding window on model
 accuracy, real GPU kernels, multi-GPU or tensor parallelism, speculative decoding.
@@ -642,23 +642,40 @@ In continuous batching every running request is read at every decode step, so
 "least recently used" over running requests is just FIFO. LRU means something once
 some caches sit **idle**:
 
+Built in `kvsim/sessions.py` and the simulator, with `simulate(..., sessions=...)`
+and the `kvsim sessions` command:
+
 * **Workload:** sessions with several turns. Each turn has new prompt tokens, an
-  output length and a think time (idle steps before the user's next message). The
-  context of turn `k` is all earlier turns plus the new prompt.
-* **Kept cache:** when a turn finishes, its KV stays in memory as `CACHED` (idle).
-  If the next turn arrives while the cache is still there (a **hit**), only the new
-  prompt tokens are prefilled. If the cache was evicted (a **miss**), the whole
-  history is prefilled again.
-* **Eviction order:** under memory pressure, cached sessions are evicted first, using
-  `--cache-policy lru` (least recently finished) or `fifo` (oldest session). Only
-  then are running requests preempted (11.2).
-* **Optional bound:** for an idle session, the next turn's arrival step
-  (`finish + think time`) is already known. Belady's optimal policy ("evict the one
-  needed furthest in the future") can therefore be computed exactly and shown next
-  to LRU and FIFO.
-* **Metrics:** hit rate, prefill tokens saved, cache evictions.
-* Tests include a crafted sequence where LRU and FIFO choose different victims, as
-  in the classic OS exercise.
+  output length and a think time. The prompt of turn `k` is every earlier prompt and
+  answer plus the new message. Turn `k + 1` is only created when turn `k` finishes,
+  and arrives `think_steps` later. `generate_sessions` stops a session early once its
+  next turn would no longer fit in `max_model_len`.
+* **Kept cache:** when a turn finishes, its KV stays in memory as an idle cache. All
+  turns of a session share one allocation. If the next turn arrives while the cache
+  is still there (a **hit**), only the new tokens are prefilled: the last answer token,
+  whose KV was never written, plus the new message. If the cache was evicted (a
+  **miss**), the whole history is prefilled again.
+* **Eviction order:** idle caches are dropped before anyone waits in the queue, is
+  swapped back in, or is preempted (11.2). `--cache-policy` picks which one:
+  `lru` (its last turn finished longest ago), `fifo` (in the cache the longest) or
+  `opt` (Belady: its next turn arrives furthest in the future). OPT can be computed
+  exactly, because an idle session's next arrival (`finish + think time`) is already
+  known. It is not a guaranteed upper bound here, though: Belady's proof assumes
+  equal-sized pages and a fixed request sequence, while session caches differ in
+  size and each eviction changes when later turns run. With 60 sessions FIFO edges
+  past it (95.3% against 94.8%).
+* **Limits:** sessions need the paged allocator without a window. A turn that could
+  never fit is rejected, which ends its session and frees its kept cache.
+* **Metrics:** `cache_hits`, `cache_misses`, `cache_hit_rate`, `cache_evictions`,
+  `saved_prefill_tokens`, and a `cached` column in the step trace. Idle caches count
+  as used memory, and their block slack as internal fragmentation.
+* **Tests** (`tests/test_sessions.py`): a hit worked out by hand (7 new tokens instead
+  of 21), an eviction that turns the next turn into a miss, and three idle caches for
+  which LRU, FIFO and OPT each choose a different victim.
+* **Result** (E9 in `docs/part2-results.md`): 200 sessions on LLaMA-7B / RTX 4090 give
+  hit rates of 14.0% (LRU), 14.8% (FIFO) and 17.7% (OPT). LRU loses to FIFO because
+  think times are capped, so the session idle the longest is the one most likely to
+  come back soon.
 
 ## 12. Metrics
 
@@ -682,6 +699,7 @@ steps. Also preemptions, tokens recomputed, bytes swapped, and peak KV held.
 | `preemptions`, `overflow_events`, `admission_stalls`, `frag_stalls` | counts |
 | `recompute_tokens`, `swap_out_bytes`, `swap_in_bytes`, `swap_fallbacks` | eviction cost (`swap_fallbacks`: swaps that became recomputes because swap space was full) |
 | `queue_p50/p95`, `ttft_p50/p95`, `e2e_p50/p95` | per-request latencies in steps |
+| `sessions`, `cache_hits`, `cache_misses`, `cache_hit_rate`, `cache_evictions`, `saved_prefill_tokens` | multi-turn sessions (M9); 0 or empty otherwise |
 
 Averages are taken over recorded (busy) steps with equal weight. Prefill and decode
 steps take different amounts of real time, so Part 3 can weight them by time if
@@ -700,6 +718,7 @@ pins them (section 16). Columns marked **P3** are the ones Part 3 needs.
 | `phase` **P3** | `prefill` or `decode` |
 | `batch_size` **P3** | requests processed in this forward pass |
 | `running`, `waiting`, `swapped` | requests in each state after the step |
+| `cached` | idle session caches kept between turns (M9; 0 without sessions) |
 | `prefill_tokens` **P3** | prompt tokens processed |
 | `output_tokens` **P3** | output tokens emitted |
 | `kv_tokens` | token states stored after the step |
@@ -769,6 +788,7 @@ model, GPU and precision flags (`--kv-dtype`, `--weight-dtype`, `--prefill-chunk
 | `kvsim simulate MODEL GPU` | run one configuration; print the pool, the summary and a sample of steps |
 | `kvsim compare MODEL GPU` | run several allocator configurations on the same workload; one summary row each |
 | `kvsim blocksweep MODEL GPU` | run the paged allocator with a range of block sizes; one row each |
+| `kvsim sessions MODEL GPU` | multi-turn chats with kept caches; one row per cache policy (`--policies lru,fifo,opt`, `--num-sessions`, `--turns`, `--think`, `--arrival-rate`) |
 
 Flags:
 
@@ -811,7 +831,7 @@ check, not a result.
 | E6 | External fragmentation | `--allocator contiguous --reservation request --max-new-tokens 1024`, `--fit first` against `--fit best`, `uniform` lengths | `frag_stall > 0` and `external_frag_bytes > 0` for contiguous; always 0 for paged. |
 | E7 | Static against continuous batching | `--batching static` against `continuous` | Static: the batch empties out as short requests finish early, so the average batch is lower and requests wait longer. |
 | E8 | With Part 3: tokens per second | feed E2's step traces into Part 3 | Paged is faster because of bigger batches (the paper reports 2-4x [1]). |
-| E9 | M9: LRU against FIFO (against OPT) | multi-turn workload, `--cache-policy lru/fifo` | LRU gets a better hit rate than FIFO, and OPT bounds both. |
+| E9 | M9: LRU against FIFO (against OPT) | `kvsim sessions llama-7b rtx-4090` | LRU gets a better hit rate than FIFO, and OPT bounds both. Outcome: OPT was best (17.7%), but LRU (14.0%) fell below FIFO (14.8%), and OPT is not a strict bound here (section 11.6). |
 
 CSV files are git-ignored (`*.csv` in `.gitignore`). The result tables for the
 report are in [`docs/part2-results.md`](part2-results.md). It is generated by

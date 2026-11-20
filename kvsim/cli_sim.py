@@ -1,4 +1,4 @@
-"""Part 2 command-line commands: workload, simulate, compare and blocksweep.
+"""Part 2 command-line commands: workload, simulate, compare, blocksweep and sessions.
 
 Registered from ``cli.build_parser`` with one call to ``register`` so that each
 part keeps its commands in its own module.
@@ -17,7 +17,8 @@ from .simulator import (
     ALLOCATORS, BATCHING, REQUEST_COLUMNS, STEP_COLUMNS, SimConfig, SimResult, simulate,
 )
 from .allocator import FITS, RESERVATIONS
-from .eviction import PREEMPT_MODES, VICTIM_POLICIES
+from .eviction import CACHE_POLICIES, PREEMPT_MODES, VICTIM_POLICIES
+from .sessions import generate_sessions
 from .workload import PRESETS, generate_workload, load_trace, save_trace, workload_stats
 
 DEFAULT_CONFIGS = "contig-max,contig-pow2,contig-oracle,paged-16"
@@ -197,6 +198,38 @@ def cmd_blocksweep(args) -> None:
               columns, "Paged allocator by block size")
 
 
+def cmd_sessions(args) -> None:
+    policies = [p.strip().lower() for p in args.policies.split(",") if p.strip()]
+    unknown = [p for p in policies if p not in CACHE_POLICIES]
+    if unknown or not policies:
+        raise ConfigError(f"unknown cache policies {unknown}; choose from {', '.join(CACHE_POLICIES)}")
+    model, gpu = load_model(args.model), load_gpu(args.gpu)
+    max_model_len = _max_model_len(args, model)
+    scenario = _scenario(args, model, gpu)
+    pool = _pool(args, scenario)
+    lengths = {k: v for k, v in (("prompt", args.prompt_len), ("output", args.output_len)) if v}
+    sessions = generate_sessions(args.num_sessions, turns=args.turns, think=args.think,
+                                 max_model_len=max_model_len, arrival_rate=args.arrival_rate,
+                                 seed=args.seed, **lengths)
+    turns = sum(len(s.turns) for s in sessions)
+    print(f"{model.name} on {gpu.name} | KV pool {fmt_bytes(pool.total_bytes)} = "
+          f"{pool.total_tokens:,} token slots")
+    print(f"Workload: {len(sessions)} sessions, {turns} turns, seed {args.seed}")
+    rows, full = [], []
+    for policy in policies:
+        summary = simulate([], pool, _config(args, max_model_len, cache_policy=policy),
+                           sessions=sessions).summary()
+        full.append({"cache_policy": policy, **summary})
+        rows.append({"cache_policy": policy, **{c: summary[c] for c in (
+            "steps", "cache_hits", "cache_misses", "cache_hit_rate", "cache_evictions",
+            "saved_prefill_tokens", "preemptions", "e2e_p95")}})
+    print()
+    print_table(rows, "Multi-turn sessions: which idle cache to drop")
+    if args.csv:
+        write_csv(full, args.csv)
+        print(f"\nwrote {len(full)} rows to {args.csv}")
+
+
 # --- parser -------------------------------------------------------------------
 
 def _workload_parent() -> argparse.ArgumentParser:
@@ -280,6 +313,20 @@ def register(sub, out: argparse.ArgumentParser, gpu: argparse.ArgumentParser) ->
                        help="paged allocator across block sizes")
     p.add_argument("--block-sizes", type=_int_list, default=_int_list(DEFAULT_BLOCK_SIZES))
     p.set_defaults(func=cmd_blocksweep)
+
+    p = sub.add_parser("sessions", parents=[sim, gpu, engine, out],
+                       help="multi-turn chats: keep caches between turns, compare LRU/FIFO/OPT")
+    g = p.add_argument_group("sessions")
+    g.add_argument("--num-sessions", type=int, default=200, help="conversations (default 200)")
+    g.add_argument("--turns", default="uniform:2:6", metavar="SPEC", help="turns per session")
+    g.add_argument("--prompt-len", metavar="SPEC", help="new tokens per user message")
+    g.add_argument("--output-len", metavar="SPEC", help="tokens per answer")
+    g.add_argument("--think", default="uniform:1:200", metavar="SPEC", help="steps between turns")
+    g.add_argument("--arrival-rate", type=float, default=0.2, help="new sessions per step (default 0.2)")
+    g.add_argument("--seed", type=int, default=0)
+    g.add_argument("--max-model-len", type=int, help="longest conversation (default: max_context)")
+    g.add_argument("--policies", default="lru,fifo,opt", help="cache policies to compare")
+    p.set_defaults(func=cmd_sessions)
 
 
 __all__ = ["register", "parse_config_label", "STEP_COLUMNS", "REQUEST_COLUMNS"]

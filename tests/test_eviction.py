@@ -43,7 +43,10 @@ class TestVictimPolicies(unittest.TestCase):
                 self.id, self.key = id, (arrival, id)
 
         seqs = [Seq(3, 0), Seq(1, 0), Seq(2, 5)]
-        held = {1: 8, 2: 8, 3: 4}.get
+        sizes = {1: 8, 2: 8, 3: 4}
+
+        def held(seq):
+            return sizes[seq.id]
         self.assertEqual(choose_victim("lifo", seqs, held).id, 2)
         self.assertEqual(choose_victim("fifo", seqs, held).id, 1)
         self.assertEqual(choose_victim("largest", seqs, held).id, 2)  # tie on size: newest

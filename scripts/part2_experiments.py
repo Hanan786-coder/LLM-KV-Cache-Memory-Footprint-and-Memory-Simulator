@@ -1,4 +1,4 @@
-"""Run the Part 2 experiments (E1-E7) and write docs/part2-results.md.
+"""Run the Part 2 experiments (E1-E7, E9) and write docs/part2-results.md.
 
     python scripts/part2_experiments.py            # writes docs/part2-results.md
     python scripts/part2_experiments.py --stdout   # prints instead
@@ -19,6 +19,7 @@ from kvsim.budget import Scenario  # noqa: E402
 from kvsim.config import GIB, MIB, load_gpu, load_model  # noqa: E402
 from kvsim.kvpool import pool_from_scenario  # noqa: E402
 from kvsim.report import _fmt_cell  # noqa: E402
+from kvsim.sessions import generate_sessions  # noqa: E402
 from kvsim.simulator import SimConfig, simulate  # noqa: E402
 from kvsim.workload import Request, generate_requests  # noqa: E402
 
@@ -165,6 +166,31 @@ def e7_batching(requests, model, pool) -> str:
             "short requests sit idle.\n\n" + table(rows))
 
 
+def e9_sessions(model, pool) -> str:
+    sessions = generate_sessions(200, max_model_len=model.max_context, arrival_rate=0.2, seed=SEED)
+    turns = sum(len(s.turns) for s in sessions)
+    rows = []
+    for policy in ("lru", "fifo", "opt"):
+        s = simulate([], pool, SimConfig(max_model_len=model.max_context, cache_policy=policy),
+                     sessions=sessions).summary()
+        rows.append({"cache_policy": policy, **pick(s, "cache_hits", "cache_misses", "cache_hit_rate",
+                                                    "cache_evictions", "saved_prefill_tokens", "steps")})
+    return ("## E9. Multi-turn sessions: LRU, FIFO and OPT\n\nLLaMA-7B on an RTX 4090, 200 chat "
+            f"sessions ({turns} turns; 2-6 turns each, think time 1-200 steps, a new session every "
+            "5 steps on average). After a turn the session's KV-cache is kept while the user "
+            "thinks; a hit prefills only the new message, a miss prefills the whole history. "
+            "Idle caches are dropped before anyone waits or is preempted. OPT (Belady) knows "
+            "when each idle session's next turn arrives.\n\n" + table(rows) +
+            "\n\nOPT gets the most hits here. It is not a guaranteed upper bound, though: "
+            "Belady's proof assumes equal-sized pages and a fixed request sequence, while "
+            "session caches differ in size and each eviction changes when later turns run "
+            "(with 60 sessions FIFO edges past it, 95.3% to 94.8%). LRU does slightly worse than FIFO here: think "
+            "times are capped at 200 steps, so the session idle the longest is the one most "
+            "likely to come back soon, the opposite of the locality LRU relies on. The step "
+            "counts are equal because a prefill takes one step however long it is; the saving "
+            "shows up as fewer prefill tokens, which Part 3 turns into less compute time.")
+
+
 def build() -> str:
     model, gpu, pool = setup("llama-7b", "rtx-4090")
     chat = generate_requests(500, preset="chat", max_model_len=model.max_context, seed=SEED)
@@ -175,6 +201,9 @@ def build() -> str:
         "2,048 tokens, at most 256 running requests, LIFO eviction with recompute.",
         e1_growth(), e2_compare(chat, model, pool), e3_blocks(model, pool), e4_eviction(model, gpu),
         e5_window(), e6_external(model, pool), e7_batching(chat, model, pool),
+        "## E8. Tokens per second\n\nNeeds Part 3: feed the `--steps-csv` traces from E2 into "
+        "Part 3's latency model.",
+        e9_sessions(model, pool),
     ]
     return "\n\n".join(sections) + "\n"
 

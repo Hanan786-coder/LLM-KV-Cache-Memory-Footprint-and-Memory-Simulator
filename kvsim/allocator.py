@@ -250,8 +250,11 @@ class PagedAllocator(KVAllocator):
         for i in range(max(old_start // b, sinks), max(start // b, sinks)):  # now behind the window
             if i in table:
                 self._release(table.pop(i))
-        for i in self._live_blocks(start, end):
-            if i not in table:
+        # only newly reached blocks can be missing: older live ones are already held and
+        # dead ones never come back, so this stays O(1) per token for long contexts
+        first_window = max(start // b, sinks)
+        for i in range(self.blocks_for(old_end), self.blocks_for(end)):
+            if i < sinks or i >= first_window:
                 table[i] = self._take()
         self._start[seq_id], self._end[seq_id] = start, end
 

@@ -25,12 +25,14 @@ from .config import ConfigError
 
 VICTIM_POLICIES = ("lifo", "fifo", "largest")
 PREEMPT_MODES = ("recompute", "swap")
+CACHE_POLICIES = ("lru", "fifo", "opt")
 
 
-def choose_victim(policy: str, candidates: list, held_tokens: Callable[[int], int]):
-    """Pick the request to evict from ``candidates`` (objects with ``.id`` and ``.key``).
+def choose_victim(policy: str, candidates: list, held_tokens: Callable[[object], int]):
+    """Pick the running request to evict from ``candidates`` (objects with a ``.key``).
 
     ``key`` is (arrival_step, id), so ties are always broken the same way.
+    ``held_tokens(candidate)`` gives how many slots a candidate holds.
     """
     if not candidates:
         raise ValueError("no running request to evict")
@@ -39,8 +41,29 @@ def choose_victim(policy: str, candidates: list, held_tokens: Callable[[int], in
     if policy == "fifo":
         return min(candidates, key=lambda s: s.key)
     if policy == "largest":
-        return max(candidates, key=lambda s: (held_tokens(s.id), s.key))  # ties: newest
+        return max(candidates, key=lambda s: (held_tokens(s), s.key))  # ties: newest
     raise ConfigError(f"unknown eviction policy {policy!r}; choose from {', '.join(VICTIM_POLICIES)}")
+
+
+def choose_cached_victim(policy: str, entries: list):
+    """Pick the idle session cache to drop (sessions.py), like a page-replacement policy.
+
+    Each entry has ``session_id``, ``resident_since`` (when it entered the cache),
+    ``last_used`` (when its last turn finished) and ``next_arrival``.
+
+        lru  -- least recently used
+        fifo -- in the cache the longest
+        opt  -- Belady: needed again furthest in the future
+    """
+    if not entries:
+        raise ValueError("no cached session to evict")
+    if policy == "lru":
+        return min(entries, key=lambda e: (e.last_used, e.session_id))
+    if policy == "fifo":
+        return min(entries, key=lambda e: (e.resident_since, e.session_id))
+    if policy == "opt":
+        return max(entries, key=lambda e: (e.next_arrival, e.session_id))
+    raise ConfigError(f"unknown cache policy {policy!r}; choose from {', '.join(CACHE_POLICIES)}")
 
 
 class SwapSpace:

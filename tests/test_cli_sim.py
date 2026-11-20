@@ -75,6 +75,18 @@ class TestCommands(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("Paged allocator by block size", out)
 
+    def test_sessions_compares_cache_policies(self):
+        path = self.dir / "sessions.csv"
+        code, out, _ = run("sessions", "llama-7b", "rtx-4090", "--num-sessions", "20",
+                           "--pool-tokens", "3000", "--csv", str(path))
+        self.assertEqual(code, 0)
+        self.assertIn("which idle cache to drop", out)
+        with open(path, newline="", encoding="utf-8") as f:
+            self.assertEqual([r["cache_policy"] for r in csv.DictReader(f)], ["lru", "fifo", "opt"])
+        code, _, err = run("sessions", "llama-7b", "rtx-4090", "--policies", "mru")
+        self.assertEqual(code, 2)
+        self.assertIn("mru", err)
+
     def test_window_eviction_and_pool_flags(self):
         code, out, _ = run("simulate", *SMALL, "--pool-tokens", "2000", "--window", "64",
                            "--sink-tokens", "4", "--evict-policy", "fifo", "--preempt-mode", "swap")

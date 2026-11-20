@@ -105,3 +105,19 @@ Same workload as E2. With static batching nobody joins until the whole batch has
 | continuous | contig-max | 16,813 | 9.78 | 8,145 | 15,432 |
 | static | paged-16 | 38,596 | 4.14 | 20,078 | 37,067 |
 | continuous | paged-16 | 4,909 | 34.2 | 1,858 | 3,903 |
+
+## E8. Tokens per second
+
+Needs Part 3: feed the `--steps-csv` traces from E2 into Part 3's latency model.
+
+## E9. Multi-turn sessions: LRU, FIFO and OPT
+
+LLaMA-7B on an RTX 4090, 200 chat sessions (816 turns; 2-6 turns each, think time 1-200 steps, a new session every 5 steps on average). After a turn the session's KV-cache is kept while the user thinks; a hit prefills only the new message, a miss prefills the whole history. Idle caches are dropped before anyone waits or is preempted. OPT (Belady) knows when each idle session's next turn arrives.
+
+| cache_policy | cache_hits | cache_misses | cache_hit_rate | cache_evictions | saved_prefill_tokens | steps |
+|---|---|---|---|---|---|---|
+| lru | 86 | 530 | 0.14 | 530 | 22,286 | 3,478 |
+| fifo | 91 | 525 | 0.148 | 525 | 22,288 | 3,478 |
+| opt | 109 | 507 | 0.177 | 507 | 27,170 | 3,478 |
+
+OPT gets the most hits here. It is not a guaranteed upper bound, though: Belady's proof assumes equal-sized pages and a fixed request sequence, while session caches differ in size and each eviction changes when later turns run (with 60 sessions FIFO edges past it, 95.3% to 94.8%). LRU does slightly worse than FIFO here: think times are capped at 200 steps, so the session idle the longest is the one most likely to come back soon, the opposite of the locality LRU relies on. The step counts are equal because a prefill takes one step however long it is; the saving shows up as fewer prefill tokens, which Part 3 turns into less compute time.

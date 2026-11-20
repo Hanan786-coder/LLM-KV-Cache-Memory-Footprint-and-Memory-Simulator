@@ -137,6 +137,11 @@ class TestScheduler(unittest.TestCase):
                          [Status.FINISHED, Status.REJECTED, Status.FINISHED])
         self.assertEqual(result.summary()["rejected"], 1)
 
+    def test_last_arrival_rejected_while_idle(self):
+        # regression: the idle jump looked for a next arrival in an empty queue
+        result = run([Request(0, 0, 4, 2), Request(1, 50, 60, 10)], 32, block_size=4, max_model_len=128)
+        self.assertEqual([s.status for s in result.sequences], [Status.FINISHED, Status.REJECTED])
+
     def test_bad_config(self):
         for bad in ({"allocator": "buddy"}, {"batching": "dynamic"}, {"block_size": 0},
                     {"max_model_len": 1}):

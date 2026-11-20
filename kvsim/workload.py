@@ -48,9 +48,14 @@ class Request:
     prompt_len: int  # P
     output_len: int  # O: tokens it will really generate (known to the simulator only)
     max_new_tokens: int | None = None  # the client's limit; None = up to the model's max length
+    session_id: int | None = None  # multi-turn chat (sessions.py): which conversation
+    turn: int = 0  # and which turn of it; the prompt includes all earlier turns
 
     def __post_init__(self) -> None:
         _check_int("request id", self.id, 0)
+        if self.session_id is not None:
+            _check_int(f"request {self.id}: session_id", self.session_id, 0)
+        _check_int(f"request {self.id}: turn", self.turn, 0)
         for name, low in (("arrival_step", 0), ("prompt_len", 1), ("output_len", 1)):
             _check_int(f"request {self.id}: {name}", getattr(self, name), low)
         if self.max_new_tokens is not None:

@@ -24,7 +24,10 @@ from enum import Enum
 
 from .allocator import ContiguousAllocator, KVAllocator, PagedAllocator, _check_window
 from .config import GIB, ConfigError
-from .eviction import PREEMPT_MODES, VICTIM_POLICIES, SwapSpace, choose_victim
+from .eviction import (
+    CACHE_POLICIES, PREEMPT_MODES, VICTIM_POLICIES, SwapSpace, choose_cached_victim, choose_victim,
+)
+from .sessions import Session, validate_sessions
 from .kvpool import DEFAULT_MAX_NUM_SEQS, KVPool
 from .workload import Request, percentile, validate_requests
 
@@ -52,12 +55,14 @@ class SimConfig:
     evict_policy: str = "lifo"  # lifo | fifo | largest
     preempt_mode: str = "recompute"  # recompute | swap
     swap_bytes: int = 4 * GIB  # CPU swap space (vLLM's default swap_space)
+    cache_policy: str = "lru"  # sessions: which idle session cache to drop (lru | fifo | opt)
     max_steps: int = 10_000_000  # safety stop
     check_invariants: bool = False  # verify allocator and accounting after every step (tests)
 
     def __post_init__(self) -> None:
         for name, allowed in (("allocator", ALLOCATORS), ("batching", BATCHING),
-                              ("evict_policy", VICTIM_POLICIES), ("preempt_mode", PREEMPT_MODES)):
+                              ("evict_policy", VICTIM_POLICIES), ("preempt_mode", PREEMPT_MODES),
+                              ("cache_policy", CACHE_POLICIES)):
             if getattr(self, name) not in allowed:
                 raise ConfigError(f"unknown {name} {getattr(self, name)!r}; choose from {', '.join(allowed)}")
         if not isinstance(self.swap_bytes, int) or self.swap_bytes < 0:
@@ -110,10 +115,17 @@ class Sequence:
     swapped_tokens: int = 0  # slots it occupies in swap space while SWAPPED
     peak_kv_tokens: int = 0
     peak_held_tokens: int = 0
+    resident_since: int | None = None  # sessions: when this session's cache was first built
 
     @property
     def id(self) -> int:
         return self.request.id
+
+    @property
+    def alloc_key(self):
+        """Key of its KV memory in the allocator; all turns of a session share one."""
+        sid = self.request.session_id
+        return self.request.id if sid is None else ("session", sid)
 
     @property
     def key(self) -> tuple[int, int]:
@@ -147,6 +159,7 @@ class StepStats:
     running: int
     waiting: int
     swapped: int
+    cached: int  # idle session caches kept between turns (sessions only)
     prefill_tokens: int
     output_tokens: int
     kv_tokens: int  # token states stored after the step
@@ -185,9 +198,9 @@ REQUEST_COLUMNS = (
 
 class SimResult:
     def __init__(self, config: SimConfig, allocator: KVAllocator, steps: list[StepStats],
-                 sequences: list[Sequence], swap_fallbacks: int = 0) -> None:
+                 sequences: list[Sequence], counters: dict | None = None) -> None:
         self.config = config
-        self.swap_fallbacks = swap_fallbacks  # swaps that became recomputes (swap space full)
+        self.counters = counters or {}  # run totals that have no per-step column
         self.allocator_name = allocator.name
         self.bytes_per_token = allocator.pool.bytes_per_token
         self.capacity_tokens = allocator.capacity_tokens
@@ -263,10 +276,22 @@ class SimResult:
             "recompute_tokens": sum(s.recompute_tokens for s in steps),
             "swap_out_bytes": sum(s.swap_out_bytes for s in steps),
             "swap_in_bytes": sum(s.swap_in_bytes for s in steps),
-            "swap_fallbacks": self.swap_fallbacks,
+            "swap_fallbacks": self.counters.get("swap_fallbacks", 0),
             "queue_p50": pct("queue_steps", 50), "queue_p95": pct("queue_steps", 95),
             "ttft_p50": pct("ttft_steps", 50), "ttft_p95": pct("ttft_steps", 95),
             "e2e_p50": pct("e2e_steps", 50), "e2e_p95": pct("e2e_steps", 95),
+            **self._session_summary(),
+        }
+
+    def _session_summary(self) -> dict:
+        hits, misses = self.counters.get("cache_hits", 0), self.counters.get("cache_misses", 0)
+        return {
+            "sessions": self.counters.get("sessions", 0),
+            "cache_hits": hits,
+            "cache_misses": misses,
+            "cache_hit_rate": hits / (hits + misses) if hits + misses else None,
+            "cache_evictions": self.counters.get("cache_evictions", 0),
+            "saved_prefill_tokens": self.counters.get("saved_prefill_tokens", 0),
         }
 
 
@@ -279,21 +304,48 @@ class _StepCounters:
         self.swap_out = self.swap_in = self.recompute_tokens = 0
 
 
+@dataclass
+class CachedSession:
+    """An idle session whose KV-cache is kept between turns."""
+
+    session_id: int
+    alloc_key: object
+    kv_len: int
+    resident_since: int  # when this cache was first built (for FIFO)
+    last_used: int  # when its last turn finished (for LRU)
+    next_arrival: int  # when its next turn arrives (for OPT)
+
+
 class Simulator:
-    def __init__(self, requests: list[Request], pool: KVPool, config: SimConfig) -> None:
-        validate_requests(requests, config.max_model_len)
+    def __init__(self, requests: list[Request], pool: KVPool, config: SimConfig,
+                 sessions: list[Session] | None = None) -> None:
         self.config = config
+        self.sessions = {s.id: s for s in sessions or []}
+        if self.sessions:
+            if config.allocator != "paged" or config.window is not None:
+                raise ConfigError("multi-turn sessions need the paged allocator without a window")
+            validate_sessions(list(self.sessions.values()), config.max_model_len)
+        self._next_id = max((r.id for r in requests), default=-1) + 1
+        requests = list(requests) + [self._turn_request(s, 0, s.start_step) for s in self.sessions.values()]
+        validate_requests(requests, config.max_model_len)
         self.alloc = make_allocator(config, pool)
         self.sequences = [Sequence(r, kv_cap=config.kv_cap)
                           for r in sorted(requests, key=lambda r: (r.arrival_step, r.id))]
         self.pending = deque(self.sequences)  # not arrived yet
+        self.cache: dict[int, CachedSession] = {}  # idle session caches, by session id
+        self.counters = {"swap_fallbacks": 0, "sessions": len(self.sessions), "cache_hits": 0,
+                         "cache_misses": 0, "cache_evictions": 0, "saved_prefill_tokens": 0}
         self.waiting: deque[Sequence] = deque()  # arrived, FCFS
         self.running: list[Sequence] = []  # hold GPU memory, kept in priority order
         self.swapped: list[Sequence] = []  # KV in CPU swap space, kept in priority order
         self.swap = SwapSpace(config.swap_bytes // pool.bytes_per_token)
-        self.swap_fallbacks = 0
         self.steps: list[StepStats] = []
         self.now = 0
+
+    def _turn_request(self, session: Session, k: int, arrival_step: int) -> Request:
+        request = session.request(k, self._next_id, arrival_step)
+        self._next_id += 1
+        return request
 
     # --- main loop ---
     def run(self) -> SimResult:
@@ -302,11 +354,12 @@ class Simulator:
                 raise SimulationError(f"stopped after {self.config.max_steps} steps")
             self._arrivals()
             if not (self.waiting or self.running or self.swapped):  # idle: jump to the next arrival
-                self.now = self.pending[0].request.arrival_step
+                if self.pending:  # (empty if the last arrival was just rejected)
+                    self.now = self.pending[0].request.arrival_step
                 continue
             self._step()
             self.now += 1
-        return SimResult(self.config, self.alloc, self.steps, self.sequences, self.swap_fallbacks)
+        return SimResult(self.config, self.alloc, self.steps, self.sequences, self.counters)
 
     @staticmethod
     def _insert(queue: list | deque, seq: Sequence) -> None:
@@ -320,7 +373,21 @@ class Simulator:
             if self._fits_alone(seq):
                 self.waiting.append(seq)
             else:
-                seq.status = Status.REJECTED
+                seq.status = Status.REJECTED  # a session ends here: drop its kept cache
+                entry = self.cache.pop(seq.request.session_id, None)
+                if entry is not None:
+                    self.alloc.free(entry.alloc_key)
+
+    def _evict_cached(self, keep: int | None = None) -> bool:
+        """Drop one idle session cache (not session ``keep``); False if there is none."""
+        entries = [e for sid, e in self.cache.items() if sid != keep]
+        if not entries:
+            return False
+        victim = choose_cached_victim(self.config.cache_policy, entries)
+        self.alloc.free(victim.alloc_key)
+        del self.cache[victim.session_id]
+        self.counters["cache_evictions"] += 1
+        return True
 
     def _fits_alone(self, seq: Sequence) -> bool:
         """Could this request run to completion in an otherwise empty pool?"""
@@ -344,7 +411,7 @@ class Simulator:
             self._decode(c)
         for seq in self.running:
             seq.peak_kv_tokens = max(seq.peak_kv_tokens, seq.kv_len)
-            seq.peak_held_tokens = max(seq.peak_held_tokens, self.alloc.held_tokens(seq.id))
+            seq.peak_held_tokens = max(seq.peak_held_tokens, self.alloc.held_tokens(seq.alloc_key))
         self._finish(c)
         self._record(phase, c)
 
@@ -354,10 +421,13 @@ class Simulator:
         while self.swapped and len(self.running) < self.config.max_num_seqs:
             seq = self.swapped[0]
             # room for its cache plus the next token, so it is not evicted again at once
-            if not self.alloc.can_admit(seq.id, seq.kv_len + 1, reserve_watermark=False):
+            while (not self.alloc.can_admit(seq.alloc_key, seq.kv_len + 1, reserve_watermark=False)
+                   and self._evict_cached()):
+                pass  # idle session caches go first
+            if not self.alloc.can_admit(seq.alloc_key, seq.kv_len + 1, reserve_watermark=False):
                 break
             self.swapped.pop(0)
-            self.alloc.admit(seq.id, seq.kv_len, reserve_watermark=False)
+            self.alloc.admit(seq.alloc_key, seq.kv_len, reserve_watermark=False)
             self.swap.release(seq.swapped_tokens)
             c.swap_in += seq.swapped_tokens
             seq.swap_bytes += seq.swapped_tokens * self.alloc.pool.bytes_per_token
@@ -373,19 +443,44 @@ class Simulator:
         budget = self.config.max_batched_tokens - sum(s.prefill_remaining for s in self.running)
         while self.waiting and budget > 0 and len(self.running) < self.config.max_num_seqs:
             seq = self.waiting[0]
-            # a new request prefills its prompt; a recomputed one prefills everything it
-            # knew: prompt + generated tokens (P + g), which rebuilds its cache
-            n = seq.request.prompt_len + seq.generated
-            if seq.generated and seq.kv_cap is not None:  # with a window only the kept
-                n = min(n, seq.kv_cap + 1)  # tokens are rebuilt (a simplification)
-            watermark = bool(self.running)  # waived when nothing else is running
-            if not self.alloc.can_admit(seq.id, n, seq.request, reserve_watermark=watermark):
+            sid = seq.request.session_id
+            hit = self.cache.get(sid) if sid is not None and not seq.generated else None
+            if hit is not None:
+                # cache hit: the session's KV from earlier turns is still here, so only the
+                # new tokens are prefilled (the last answer token and the new message)
+                n = seq.request.prompt_len - hit.kv_len
+                while not self.alloc.can_append(seq.alloc_key, n) and self._evict_cached(keep=sid):
+                    pass
+                fits = self.alloc.can_append(seq.alloc_key, n)
+            else:
+                # a new request prefills its prompt; a recomputed one prefills everything it
+                # knew: prompt + generated tokens (P + g), which rebuilds its cache
+                n = seq.request.prompt_len + seq.generated
+                if seq.generated and seq.kv_cap is not None:  # with a window only the kept
+                    n = min(n, seq.kv_cap + 1)  # tokens are rebuilt (a simplification)
+                watermark = bool(self.running)  # waived when nothing else is running
+                while (not self.alloc.can_admit(seq.alloc_key, n, seq.request, reserve_watermark=watermark)
+                       and self._evict_cached()):
+                    pass  # idle session caches go before anyone waits
+                fits = self.alloc.can_admit(seq.alloc_key, n, seq.request, reserve_watermark=watermark)
+            if not fits:
                 c.admission_stall = 1
                 if isinstance(self.alloc, ContiguousAllocator):
                     c.frag_stall = int(self.alloc.free_tokens() >= self.alloc.reservation_for(seq.request))
                 break
             self.waiting.popleft()
-            self.alloc.admit(seq.id, n, seq.request, reserve_watermark=watermark)
+            if hit is not None:
+                self.alloc.append(seq.alloc_key, n)
+                del self.cache[sid]
+                seq.kv_len, seq.resident_since = hit.kv_len, hit.resident_since
+                self.counters["cache_hits"] += 1
+                self.counters["saved_prefill_tokens"] += hit.kv_len
+            else:
+                self.alloc.admit(seq.alloc_key, n, seq.request, reserve_watermark=watermark)
+                if sid is not None and not seq.generated:
+                    seq.resident_since = self.now
+                    if seq.request.turn > 0:
+                        self.counters["cache_misses"] += 1
             seq.status = Status.RUNNING
             seq.prefill_target, seq.prefill_done = n, 0
             if seq.admitted_step is None:
@@ -420,16 +515,18 @@ class Simulator:
             if seq.status is not Status.RUNNING:
                 continue  # preempted earlier in this step
             overflowed = False
-            while not self.alloc.can_append(seq.id):
+            while not self.alloc.can_append(seq.alloc_key):
                 if not overflowed:
                     c.overflow_events += 1
                     overflowed = True
+                if self._evict_cached():  # idle session caches go before running requests
+                    continue
                 victim = self._choose_victim(seq)
                 self._preempt(victim, c)
                 if victim is seq:
                     break
             else:
-                self.alloc.append(seq.id)  # the slot is claimed now
+                self.alloc.append(seq.alloc_key)  # the slot is claimed now
                 decoded.append(seq)
         for seq in decoded:
             if seq.status is Status.RUNNING:
@@ -442,12 +539,13 @@ class Simulator:
                 c.batch_size += 1
 
     def _choose_victim(self, needy: Sequence) -> Sequence:
-        return choose_victim(self.config.evict_policy, self.running, self.alloc.held_tokens)
+        return choose_victim(self.config.evict_policy, self.running,
+                             lambda s: self.alloc.held_tokens(s.alloc_key))
 
     def _preempt(self, victim: Sequence, c: _StepCounters) -> None:
         """Evict all of ``victim``'s blocks: swap them out, or drop them to recompute later."""
-        held = self.alloc.held_tokens(victim.id)
-        self.alloc.free(victim.id)  # also drops a slot it may have claimed this step
+        held = self.alloc.held_tokens(victim.alloc_key)
+        self.alloc.free(victim.alloc_key)  # also drops a slot it may have claimed this step
         self.running.remove(victim)
         victim.preemptions += 1
         c.preempted += 1
@@ -460,7 +558,7 @@ class Simulator:
                 c.swap_out += held
                 self._insert(self.swapped, victim)
                 return
-            self.swap_fallbacks += 1  # swap space is full: recompute instead
+            self.counters["swap_fallbacks"] += 1  # swap space is full: recompute instead
         victim.recompute_tokens += victim.kv_len
         c.recompute_tokens += victim.kv_len
         victim.kv_len = 0
@@ -472,24 +570,43 @@ class Simulator:
         still_running = []
         for seq in self.running:
             if seq.generated >= seq.request.output_len:
-                self.alloc.free(seq.id)
                 seq.status = Status.FINISHED
                 seq.finish_step = self.now
                 c.finished += 1
+                if not self._next_turn(seq):
+                    self.alloc.free(seq.alloc_key)
             else:
                 still_running.append(seq)
         self.running = still_running
+
+    def _next_turn(self, seq: Sequence) -> bool:
+        """If ``seq`` was a session turn with more to come, schedule the next turn and
+        keep this session's KV-cache while the user thinks. Returns True if kept."""
+        sid, k = seq.request.session_id, seq.request.turn
+        if sid is None or k + 1 >= len(self.sessions[sid].turns):
+            return False
+        session = self.sessions[sid]
+        arrival = self.now + session.turns[k + 1].think_steps
+        nxt = Sequence(self._turn_request(session, k + 1, arrival), kv_cap=self.config.kv_cap)
+        self.sequences.append(nxt)
+        self._insert(self.pending, nxt)
+        self.cache[sid] = CachedSession(sid, seq.alloc_key, seq.kv_len, seq.resident_since or self.now,
+                                        last_used=self.now, next_arrival=arrival)
+        return True
 
     # --- accounting ---
     def _record(self, phase: str, c: _StepCounters) -> None:
         a, bpt = self.alloc, self.alloc.pool.bytes_per_token
         used = reserved = internal = 0
         for seq in self.running:
-            held = a.held_tokens(seq.id)
+            held = a.held_tokens(seq.alloc_key)
             fill = min(held, seq.final_tokens)
             used += seq.kv_len
             reserved += fill - seq.kv_len
             internal += held - fill
+        for entry in self.cache.values():  # idle session caches: kept tokens, slack never filled
+            used += entry.kv_len
+            internal += a.held_tokens(entry.alloc_key) - entry.kv_len
         allocated = a.allocated_tokens()
         free = a.capacity_tokens - allocated
         external = free - a.largest_free_run()
@@ -497,10 +614,11 @@ class Simulator:
         if self.config.check_invariants:
             a.check_invariants()
             assert used + reserved + internal == allocated, "memory breakdown does not add up"
-            assert all(s.kv_len <= a.num_tokens(s.id) for s in self.running)
+            assert all(s.kv_len <= a.num_tokens(s.alloc_key) for s in self.running)
         self.steps.append(StepStats(
             step=self.now, phase=phase, batch_size=c.batch_size, running=len(self.running),
-            waiting=len(self.waiting), swapped=len(self.swapped), prefill_tokens=c.prefill_tokens,
+            waiting=len(self.waiting), swapped=len(self.swapped), cached=len(self.cache),
+            prefill_tokens=c.prefill_tokens,
             output_tokens=c.output_tokens, kv_tokens=used, kv_used_bytes=used * bpt,
             kv_read_bytes=c.kv_read * bpt, kv_write_bytes=c.kv_write * bpt,
             attention_pairs=c.attention_pairs, kv_allocated_bytes=allocated * bpt,
@@ -517,6 +635,11 @@ class Simulator:
         ))
 
 
-def simulate(requests: list[Request], pool: KVPool, config: SimConfig | None = None) -> SimResult:
-    """Run the whole workload and return the per-step and per-request traces."""
-    return Simulator(requests, pool, config or SimConfig()).run()
+def simulate(requests: list[Request], pool: KVPool, config: SimConfig | None = None,
+             sessions: list[Session] | None = None) -> SimResult:
+    """Run the whole workload and return the per-step and per-request traces.
+
+    ``sessions`` adds multi-turn chats (``sessions.py``): each turn is created when
+    the previous one finishes, and the session's cache is kept in between.
+    """
+    return Simulator(requests, pool, config or SimConfig(), sessions).run()

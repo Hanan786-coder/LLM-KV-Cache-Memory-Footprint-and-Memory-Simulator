@@ -353,7 +353,6 @@ class KVAllocator(ABC):
     def admit(self, seq_id, n_tokens, request=None) -> None: ...  # claim slots for the prompt
     def can_append(self, seq_id, n=1) -> bool: ...
     def append(self, seq_id, n=1) -> None: ...                    # claim slots for new tokens
-    def trim_front(self, seq_id, n) -> None: ...                  # sliding window (added in M6)
     def free(self, seq_id) -> int: ...                            # release everything; returns slots freed
 
     # accounting, all in token slots
@@ -370,6 +369,10 @@ class KVAllocator(ABC):
 allocator, which uses it to size the reservation. The paged allocator ignores it.
 Calling `admit` or `append` when `can_*` is false, or using an unknown `seq_id`,
 raises `AllocationError`. The scheduler always checks first.
+
+Both allocators take `window` and `sink_tokens` and apply the sliding window
+themselves inside `admit` and `append` (section 11.4). The scheduler never trims
+anything, and `can_append` already counts any block the window is about to free.
 
 ### 9.2 Paged allocator (vLLM-style)
 
@@ -541,10 +544,7 @@ blocks already taken this step:
 decoded = []
 for seq in running, oldest first:
     if seq was preempted earlier in this step: continue
-    if window and seq.kv_len == sink_tokens + window:
-        allocator.trim_front(seq, 1)                # drop the oldest non-sink token; may free a block
-        seq.kv_len -= 1
-    overflowed = False
+    overflowed = False                              # (a window frees old blocks inside append)
     while not allocator.can_append(seq):            # paged only: no free block
         if not overflowed:
             overflow_events += 1; overflowed = True
@@ -556,7 +556,7 @@ for seq in running, oldest first:
         decoded.append(seq)
 for seq in decoded:
     if seq is still running:                        # it may have been preempted later in the loop
-        seq.kv_len += 1; seq.generated += 1
+        seq.kv_len = min(seq.kv_len + 1, kv_cap); seq.generated += 1   # kv_cap = S + W, if set
         kv_write_tokens += 1
         kv_read_tokens  += seq.kv_len               # attention reads the whole cache, new entry included
         attention_pairs += seq.kv_len
@@ -619,8 +619,10 @@ Ties are broken by arrival step, then request id.
   StreamingLLM keeps [4]) plus the latest `W` tokens. Everything in between is
   dropped. Mistral-7B v0.1 used a window of 4,096 tokens [3].
 * **Paged:** a block is kept while any of its positions is a sink or inside the
-  window. When the window moves past the end of a block, that block is freed. A
-  request therefore holds at most `ceil(S/B) + ceil(W/B) + 1` blocks.
+  window. When the window moves past the end of a block, `append` frees that block
+  before it claims a new one. A request therefore holds at most
+  `ceil(S/B) + ceil(W/B) + 1` blocks. A prompt longer than the window only gets
+  blocks for the sinks and its last `W` tokens, although all `P` are still processed.
 * **Contiguous:** the reservation is capped at `S + W` and used as a ring buffer, so
   it never grows.
 * Attention reads at most `S + W` entries per request, so `kv_read_bytes` stops
@@ -848,6 +850,11 @@ numbers):
   `contig-max`, and needs 4,909 steps against 16,813 (about 3.4x fewer, in line with
   the paper's 2-4x). LIFO recomputes the fewest tokens (80,200 against 127,068 for
   FIFO), and largest-first evicts least often (92 preemptions against 384 for LIFO).
+* First window result at M6 (Mistral-7B on an RTX 4090, 300 `long-output`
+  requests): a 512-token window cuts the run from 3,489 to 2,798 steps and raises the
+  average decode batch from 91 to 113, with preemptions falling from 299 to 115. A
+  4,096-token window changes nothing, because no request in that workload is longer
+  than 1,664 tokens.
 * Very short requests (20-100 tokens) bring `paged-16` down to about 86%, because a
   half-empty 16-token block is a large share of each one. 4-token blocks give about
   97%. This is the paper's observation that large blocks hurt short sequences.

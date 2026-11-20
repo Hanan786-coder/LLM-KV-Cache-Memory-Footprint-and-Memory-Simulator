@@ -30,6 +30,15 @@ class AllocationError(RuntimeError):
     """An allocator call that is not allowed right now (check ``can_*`` first)."""
 
 
+def _check_window(window: int | None, sink_tokens: int) -> None:
+    if window is not None and (not isinstance(window, int) or isinstance(window, bool) or window < 1):
+        raise ConfigError(f"window must be a positive number of tokens, got {window!r}")
+    if not isinstance(sink_tokens, int) or isinstance(sink_tokens, bool) or sink_tokens < 0:
+        raise ConfigError(f"sink_tokens must be an integer >= 0, got {sink_tokens!r}")
+    if sink_tokens and window is None:
+        raise ConfigError("sink_tokens only make sense with a sliding window")
+
+
 class KVAllocator(ABC):
     """What the scheduler needs from any allocator."""
 
@@ -102,9 +111,19 @@ class PagedAllocator(KVAllocator):
 
     Any free block can serve any request, so there is no external fragmentation.
     The only waste is the unfilled end of each request's last block.
+
+    Sliding window (``window`` W, ``sink_tokens`` S): a request keeps token
+    positions ``[0, S)`` (the attention sinks) and its latest W positions. Logical
+    block ``i`` covers positions ``[i*B, (i+1)*B)`` and is kept while it overlaps
+    either range; ``append`` frees blocks the window has moved past.
     """
 
-    def __init__(self, pool: KVPool, block_size: int = 16, watermark: float = 0.01) -> None:
+    def __init__(self, pool: KVPool, block_size: int = 16, watermark: float = 0.01,
+                 window: int | None = None, sink_tokens: int = 0) -> None:
+        _check_window(window, sink_tokens)
+        self.window = window
+        self.sink_tokens = sink_tokens
+        self.sink_blocks = math.ceil(sink_tokens / block_size) if block_size > 0 else 0
         self.pool = pool
         self.block_size = block_size
         self.num_blocks = pool.num_blocks(block_size)  # validates block_size
@@ -117,24 +136,50 @@ class PagedAllocator(KVAllocator):
         self.name = f"paged-{block_size}"
         self._free: list[int] = list(range(self.num_blocks - 1, -1, -1))  # pop() gives block 0 first
         self._ref_count = [0] * self.num_blocks  # always 0 or 1 until prefix sharing (stretch)
-        self._tables: dict[int, list[int]] = {}
-        self._tokens: dict[int, int] = {}
+        self._tables: dict[int, dict[int, int]] = {}  # seq_id -> {logical block: physical block}
+        self._end: dict[int, int] = {}  # positions written or claimed so far
+        self._start: dict[int, int] = {}  # first kept position after the sinks
 
     # --- helpers ---
     def blocks_for(self, n_tokens: int) -> int:
         return math.ceil(n_tokens / self.block_size)
 
-    def _table(self, seq_id: int) -> list[int]:
+    def _window_start(self, end: int, start: int | None = None) -> int:
+        start = self.sink_tokens if start is None else start
+        return start if self.window is None else max(start, end - self.window)
+
+    def _live_blocks(self, start: int, end: int) -> list[int]:
+        """Logical blocks kept when positions [0, S) and [start, end) are live."""
+        n_end = self.blocks_for(end)
+        sinks = min(self.sink_blocks, n_end)
+        return list(range(sinks)) + list(range(max(start // self.block_size, sinks), n_end))
+
+    def _live_count(self, start: int, end: int) -> int:
+        n_end = self.blocks_for(end)
+        sinks = min(self.sink_blocks, n_end)
+        return sinks + max(0, n_end - max(start // self.block_size, sinks))
+
+    def max_blocks(self, positions: int) -> int:
+        """Most blocks a request ever holds while growing to ``positions`` tokens."""
+        full = self.blocks_for(positions)
+        if self.window is None:
+            return full
+        return min(full, self.sink_blocks + self.blocks_for(self.window) + 1)
+
+    def _table(self, seq_id: int) -> dict[int, int]:
         try:
             return self._tables[seq_id]
         except KeyError:
             raise AllocationError(f"request {seq_id} holds no blocks") from None
 
-    def _take(self, n_blocks: int) -> list[int]:
-        taken = [self._free.pop() for _ in range(n_blocks)]
-        for block in taken:
-            self._ref_count[block] = 1
-        return taken
+    def _take(self) -> int:
+        block = self._free.pop()
+        self._ref_count[block] = 1
+        return block
+
+    def _release(self, block: int) -> None:
+        self._ref_count[block] = 0
+        self._free.append(block)
 
     @staticmethod
     def _check_count(n: int) -> None:
@@ -159,7 +204,8 @@ class PagedAllocator(KVAllocator):
         return BLOCK_TABLE_ENTRY_BYTES * self.blocks_used
 
     def block_table(self, seq_id: int) -> list[int]:
-        return list(self._table(seq_id))
+        """Physical blocks the request holds, in logical order."""
+        return list(self._table(seq_id).values())
 
     # --- admission and growth ---
     def can_admit(self, seq_id: int, n_tokens: int, request: Request | None = None,
@@ -170,43 +216,58 @@ class PagedAllocator(KVAllocator):
         # keep a watermark of free blocks so a new request does not force an
         # eviction on its very next step; growth (append) ignores it
         keep = self.watermark_blocks if reserve_watermark else 0
-        return len(self._free) - self.blocks_for(n_tokens) >= keep
+        need = self._live_count(self._window_start(n_tokens), n_tokens)
+        return len(self._free) - need >= keep
 
     def admit(self, seq_id: int, n_tokens: int, request: Request | None = None,
               reserve_watermark: bool = True) -> None:
+        """Claim the prompt's slots; with a window only the sinks and the last W are kept."""
         if seq_id in self._tables:
             raise AllocationError(f"request {seq_id} is already admitted")
         if not self.can_admit(seq_id, n_tokens, request, reserve_watermark):
             raise AllocationError(f"not enough free blocks to admit request {seq_id}")
-        self._tables[seq_id] = self._take(self.blocks_for(n_tokens))
-        self._tokens[seq_id] = n_tokens
+        start = self._window_start(n_tokens)
+        self._tables[seq_id] = {i: self._take() for i in self._live_blocks(start, n_tokens)}
+        self._start[seq_id], self._end[seq_id] = start, n_tokens
 
-    def _new_blocks_needed(self, seq_id: int, n: int) -> int:
+    def _net_new_blocks(self, seq_id: int, n: int) -> int:
         table = self._table(seq_id)  # raises AllocationError for an unknown request
-        return self.blocks_for(self._tokens[seq_id] + n) - len(table)
+        end = self._end[seq_id] + n
+        return self._live_count(self._window_start(end, self._start[seq_id]), end) - len(table)
 
     def can_append(self, seq_id: int, n: int = 1) -> bool:
         self._check_count(n)
-        return self._new_blocks_needed(seq_id, n) <= len(self._free)
+        return self._net_new_blocks(seq_id, n) <= len(self._free)
 
     def append(self, seq_id: int, n: int = 1) -> None:
+        """Claim ``n`` more positions; with a window, first free blocks it has moved past."""
         if not self.can_append(seq_id, n):
             raise AllocationError(f"no free block for request {seq_id}")
-        self._tables[seq_id].extend(self._take(self._new_blocks_needed(seq_id, n)))
-        self._tokens[seq_id] += n
+        table, old_start, old_end = self._tables[seq_id], self._start[seq_id], self._end[seq_id]
+        end = old_end + n
+        start = self._window_start(end, old_start)
+        b, sinks = self.block_size, self.sink_blocks
+        for i in range(max(old_start // b, sinks), max(start // b, sinks)):  # now behind the window
+            if i in table:
+                self._release(table.pop(i))
+        for i in self._live_blocks(start, end):
+            if i not in table:
+                table[i] = self._take()
+        self._start[seq_id], self._end[seq_id] = start, end
 
     def free(self, seq_id: int) -> int:
         table = self._table(seq_id)
-        for block in table:
-            self._ref_count[block] = 0
-        self._free.extend(reversed(table))  # freed blocks are reused first
-        del self._tables[seq_id], self._tokens[seq_id]
+        for block in reversed(list(table.values())):  # its first block is reused first
+            self._release(block)
+        del self._tables[seq_id], self._start[seq_id], self._end[seq_id]
         return len(table) * self.block_size
 
     # --- accounting ---
     def num_tokens(self, seq_id: int) -> int:
+        """Positions the request keeps: the sinks plus its window (all of them without one)."""
         self._table(seq_id)
-        return self._tokens[seq_id]
+        start, end, s = self._start[seq_id], self._end[seq_id], self.sink_tokens
+        return min(end, s) + max(0, end - max(start, s))
 
     def held_tokens(self, seq_id: int) -> int:
         return len(self._table(seq_id)) * self.block_size
@@ -221,16 +282,18 @@ class PagedAllocator(KVAllocator):
         return seq_id in self._tables
 
     def check_invariants(self) -> None:
-        held = [block for table in self._tables.values() for block in table]
+        held = [block for table in self._tables.values() for block in table.values()]
         everything = held + self._free
         assert sorted(everything) == list(range(self.num_blocks)), "a block is lost or listed twice"
         assert all(self._ref_count[b] == 1 for b in held), "held block with ref count != 1"
         assert all(self._ref_count[b] == 0 for b in self._free), "free block with ref count != 0"
-        assert self._tables.keys() == self._tokens.keys(), "block tables and token counts disagree"
+        assert self._tables.keys() == self._end.keys() == self._start.keys(), "per-request state disagrees"
         for seq_id, table in self._tables.items():
-            tokens = self._tokens[seq_id]
-            assert tokens >= 1 and self.blocks_for(tokens) == len(table), (
-                f"request {seq_id}: {tokens} tokens in {len(table)} blocks")
+            start, end = self._start[seq_id], self._end[seq_id]
+            assert end >= 1 and list(table) == self._live_blocks(start, end), (
+                f"request {seq_id}: blocks {sorted(table)} do not match positions {start}..{end}")
+            if self.window is not None:
+                assert self.num_tokens(seq_id) <= self.sink_tokens + self.window
         assert self.allocated_tokens() + self.free_tokens() == self.capacity_tokens
 
 
@@ -275,7 +338,10 @@ class ContiguousAllocator(KVAllocator):
     """
 
     def __init__(self, pool: KVPool, max_model_len: int, reservation: str = "max",
-                 fit: str = "first") -> None:
+                 fit: str = "first", window: int | None = None, sink_tokens: int = 0) -> None:
+        _check_window(window, sink_tokens)
+        # with a window the region is a ring buffer of sinks + window slots
+        self.ring_tokens = None if window is None else sink_tokens + window
         if reservation not in RESERVATIONS:
             raise ConfigError(f"unknown reservation {reservation!r}; choose from {', '.join(RESERVATIONS)}")
         if fit not in FITS:
@@ -300,7 +366,8 @@ class ContiguousAllocator(KVAllocator):
         return self.pool.total_tokens
 
     def reservation_for(self, request: Request) -> int:
-        return reservation_tokens(request, self.reservation, self.max_model_len)
+        size = reservation_tokens(request, self.reservation, self.max_model_len)
+        return size if self.ring_tokens is None else min(size, self.ring_tokens)
 
     def holes(self) -> list[tuple[int, int]]:
         """Free regions as (start, size), in address order."""
@@ -325,7 +392,7 @@ class ContiguousAllocator(KVAllocator):
         if request is None:
             raise AllocationError("the contiguous allocator needs the request to size its reservation")
         size = self.reservation_for(request)
-        if n_tokens > size:
+        if n_tokens > size and self.ring_tokens is None:  # a ring buffer keeps only the last ones
             raise AllocationError(f"request {request.id}: {n_tokens} tokens do not fit "
                                   f"its {size}-slot reservation")
         return size
@@ -350,18 +417,19 @@ class ContiguousAllocator(KVAllocator):
             bisect.insort(self._hole_starts, start + size)
             self._hole_sizes[start + size] = hole - size
         self._regions[seq_id] = (start, size)
-        self._tokens[seq_id] = n_tokens
+        self._tokens[seq_id] = min(n_tokens, size)
         self._allocated += size
 
     def can_append(self, seq_id: int, n: int = 1) -> bool:
         PagedAllocator._check_count(n)
         size = self.region(seq_id)[1]
-        return self._tokens[seq_id] + n <= size
+        return self.ring_tokens is not None or self._tokens[seq_id] + n <= size
 
     def append(self, seq_id: int, n: int = 1) -> None:
         if not self.can_append(seq_id, n):
             raise AllocationError(f"request {seq_id} has filled its reservation")
-        self._tokens[seq_id] += n
+        size = self._regions[seq_id][1]
+        self._tokens[seq_id] = min(self._tokens[seq_id] + n, size)  # a ring overwrites the oldest
 
     def free(self, seq_id: int) -> int:
         start, size = self.region(seq_id)

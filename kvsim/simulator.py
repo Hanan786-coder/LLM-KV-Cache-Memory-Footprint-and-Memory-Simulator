@@ -22,7 +22,7 @@ from collections import deque
 from dataclasses import asdict, dataclass, fields
 from enum import Enum
 
-from .allocator import ContiguousAllocator, KVAllocator, PagedAllocator
+from .allocator import ContiguousAllocator, KVAllocator, PagedAllocator, _check_window
 from .config import GIB, ConfigError
 from .eviction import PREEMPT_MODES, VICTIM_POLICIES, SwapSpace, choose_victim
 from .kvpool import DEFAULT_MAX_NUM_SEQS, KVPool
@@ -47,6 +47,8 @@ class SimConfig:
     max_num_seqs: int = DEFAULT_MAX_NUM_SEQS  # most requests running at once
     max_batched_tokens: int = 2048  # prompt tokens per prefill step (Part 1's prefill_chunk)
     max_model_len: int = 2048  # longest prompt + output; use the model's max_context
+    window: int | None = None  # sliding window: keep only the latest W tokens
+    sink_tokens: int = 0  # with a window, also keep the first S tokens (attention sinks)
     evict_policy: str = "lifo"  # lifo | fifo | largest
     preempt_mode: str = "recompute"  # recompute | swap
     swap_bytes: int = 4 * GIB  # CPU swap space (vLLM's default swap_space)
@@ -65,12 +67,19 @@ class SimConfig:
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool) or value < low:
                 raise ConfigError(f"{name} must be an integer >= {low}, got {value!r}")
+        _check_window(self.window, self.sink_tokens)
+
+    @property
+    def kv_cap(self) -> int | None:
+        """Most KV entries one request keeps (sinks + window), or None without a window."""
+        return None if self.window is None else self.sink_tokens + self.window
 
 
 def make_allocator(config: SimConfig, pool: KVPool) -> KVAllocator:
     if config.allocator == "paged":
-        return PagedAllocator(pool, config.block_size, config.watermark)
-    return ContiguousAllocator(pool, config.max_model_len, config.reservation, config.fit)
+        return PagedAllocator(pool, config.block_size, config.watermark, config.window, config.sink_tokens)
+    return ContiguousAllocator(pool, config.max_model_len, config.reservation, config.fit,
+                               config.window, config.sink_tokens)
 
 
 class Status(Enum):
@@ -86,6 +95,7 @@ class Sequence:
     """Runtime state of one request."""
 
     request: Request
+    kv_cap: int | None = None  # sliding window: most KV entries kept (sinks + window)
     status: Status = Status.WAITING
     prefill_target: int = 0  # tokens to prefill in the current admission
     prefill_done: int = 0
@@ -117,7 +127,14 @@ class Sequence:
     @property
     def final_tokens(self) -> int:
         """Most KV entries this request will hold at once."""
-        return self.request.peak_kv_tokens
+        return self._capped(self.request.peak_kv_tokens)
+
+    def _capped(self, tokens: int) -> int:
+        return tokens if self.kv_cap is None else min(tokens, self.kv_cap)
+
+    def store(self, n: int) -> None:
+        """Write ``n`` KV entries; with a window the oldest beyond the cap are dropped."""
+        self.kv_len = self._capped(self.kv_len + n)
 
 
 @dataclass
@@ -267,7 +284,8 @@ class Simulator:
         validate_requests(requests, config.max_model_len)
         self.config = config
         self.alloc = make_allocator(config, pool)
-        self.sequences = [Sequence(r) for r in sorted(requests, key=lambda r: (r.arrival_step, r.id))]
+        self.sequences = [Sequence(r, kv_cap=config.kv_cap)
+                          for r in sorted(requests, key=lambda r: (r.arrival_step, r.id))]
         self.pending = deque(self.sequences)  # not arrived yet
         self.waiting: deque[Sequence] = deque()  # arrived, FCFS
         self.running: list[Sequence] = []  # hold GPU memory, kept in priority order
@@ -308,7 +326,7 @@ class Simulator:
         """Could this request run to completion in an otherwise empty pool?"""
         a = self.alloc
         if isinstance(a, PagedAllocator):  # the watermark is waived when nothing else runs
-            return a.blocks_for(seq.final_tokens) <= a.num_blocks
+            return a.max_blocks(seq.request.peak_kv_tokens) <= a.num_blocks
         return a.reservation_for(seq.request) <= a.capacity_tokens
 
     def _step(self) -> None:
@@ -358,6 +376,8 @@ class Simulator:
             # a new request prefills its prompt; a recomputed one prefills everything it
             # knew: prompt + generated tokens (P + g), which rebuilds its cache
             n = seq.request.prompt_len + seq.generated
+            if seq.generated and seq.kv_cap is not None:  # with a window only the kept
+                n = min(n, seq.kv_cap + 1)  # tokens are rebuilt (a simplification)
             watermark = bool(self.running)  # waived when nothing else is running
             if not self.alloc.can_admit(seq.id, n, seq.request, reserve_watermark=watermark):
                 c.admission_stall = 1
@@ -383,7 +403,7 @@ class Simulator:
             c.kv_read += seq.kv_len  # earlier chunks are read back
             c.kv_write += chunk
             c.attention_pairs += chunk * seq.kv_len + chunk * (chunk + 1) // 2
-            seq.kv_len += chunk
+            seq.store(chunk)
             seq.prefill_done += chunk
             budget -= chunk
             c.batch_size += 1
@@ -413,7 +433,7 @@ class Simulator:
                 decoded.append(seq)
         for seq in decoded:
             if seq.status is Status.RUNNING:
-                seq.kv_len += 1
+                seq.store(1)
                 seq.generated += 1
                 c.kv_write += 1
                 c.kv_read += seq.kv_len  # attention reads the whole cache, new entry included

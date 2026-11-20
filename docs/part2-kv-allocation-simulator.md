@@ -718,6 +718,11 @@ by the whole batch. That sharing is why bigger batches are less memory-bound.
 finish_step, queue_steps, ttft_steps, e2e_steps, preemptions, recompute_tokens,
 swap_bytes, peak_kv_tokens, peak_held_tokens`
 
+`queue_steps = admitted_step - arrival_step` (steps spent waiting). `ttft_steps` and
+`e2e_steps` count the arrival step itself, so a request that arrives, prefills and
+finishes in the same step has both equal to 1. The `P = 4, O = 3` request in section 6
+has `ttft_steps = 1` and `e2e_steps = 3`.
+
 ### 13.3 Python API
 
 ```python
@@ -832,7 +837,12 @@ numbers):
 
 * `chat` on LLaMA-7B: `contig-max` has `share_token_states` below 50% (the paper saw
   20.4%-38.2% for existing systems), and `paged-16` above 90% (the paper describes
-  near-zero waste).
+  near-zero waste). First result at M4 (500 `chat` requests on an RTX 4090):
+  `contig-max` 24.9%, `contig-pow2` 39.0%, `contig-oracle` 50.1%, inside or near
+  the paper's range.
+* Very short requests (20-100 tokens) bring `paged-16` down to about 86%, because a
+  half-empty 16-token block is a large share of each one. 4-token blocks give about
+  97%. This is the paper's observation that large blocks hurt short sequences.
 * Paged waste is always under one block per running request.
 * Part 1's numbers still hold: 512 KiB per token for LLaMA-7B, 128 KiB for Mistral-7B.
 
